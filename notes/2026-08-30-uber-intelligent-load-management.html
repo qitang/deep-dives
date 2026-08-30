@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Uber 智能负载管理 — 深读笔记</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Uber 智能负载管理:从静态限流到自适应过载控制</h1>
+  <div class="meta">
+    <span class="tag">文章拆解</span>
+    深读日期:2026-08-30 ·
+    原文:<a href="https://www.uber.com/gb/en/blog/from-static-rate-limiting-to-intelligent-load-management/">From Static Rate-Limiting to Intelligent Load Management</a>
+    (Uber Engineering, 2026-04-20)
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">文章总结</a></li>
+    <li><a href="#why-concurrency">核心争论:为什么用 concurrency 不用 TPS</a></li>
+    <li><a href="#stations">七站机制拆解</a></li>
+    <li><a href="#qa">我的疑问与解惑(本笔记最有价值的部分)</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. 文章总结</h2>
+
+<p><b>背景。</b>Uber 的自研分布式数据库 Docstore 和 Schemaless(建于 MySQL 之上)支撑全公司所有业务线:几千个集群、几十 PB 数据、每秒几千万请求。在这个规模上,局部过载会级联放大(超时 → 重试 → 更过载),且多租户共享底层资源,必须同时解决<b>过载保护</b>和<b>租户公平</b>两个问题。</p>
+
+<p><b>失败的第一版:routing 层的静态配额。</b>给每个租户按"处理字节数"定容量配额,用中心 Redis 记账,超了返 429。四个死因:每个请求多一跳 Redis(新故障点);无状态路由层看不见几千个存储分片的真实健康;成本模型失真(全表扫描和单行读计费相同——请求的真实成本在执行前不可知);静态配额需要无止境的人肉调整。<b>关键教训:过载控制必须住在离数据最近的地方(存储层),并且要用自我校准的信号。</b></p>
+
+<p><b>演进三代:</b></p>
+<table>
+<tr><th>代</th><th>机制</th><th>解决了</th><th>遗留问题</th></tr>
+<tr><td>一代</td><td>CoDel 队列(按等待时间拒 + 过载时 FIFO→LIFO)+ Scorecard(租户并发上限)+ regulators(写字节/热点/内存/线程保险丝)</td><td>机器压不垮了;肇事租户被隔离</td><td>拒人不分贵贱;参数写死;固定超时引发重试潮(thundering herd)</td></tr>
+<tr><td>二代</td><td>Cinnamon:优先级 t0–t5 从低往高砍;PID 控制器驱动砍人比例;超时阈值由 P90 动态定;auto-tuner 动态找并发上限 N</td><td>用户流量被优先保护;零人肉调参;shedding 从锯齿变平滑</td><td>只感知本地健康;远程信号(follower 落后)靠外挂 token bucket,多脑决策打架</td></tr>
+<tr><td>三代</td><td>统一引擎 + BYOS(bring your own signal):所有信号(本地+远程)插件化,喂进唯一决策环;按信号性质选择"按优先级砍"或"按肇事者砍"</td><td>决策一致、可观测归一、加新信号零边际成本</td><td>—</td></tr>
+</table>
+
+<p><b>实测收益</b>(对比 token bucket 时代,过载期间):吞吐 +80%(5,400 vs 3,000 QPS);P99 延迟 −70%(1.0s vs 3.1s);goroutine −93%(峰值 1 万 vs 15 万);内存 −60%(1GB vs 5–6GB 尖峰)。</p>
+
+<p><b>文章的 lessons:</b>优先级是第一位的;fail fast 别憋着;PID 让 shedding 平滑;控制放在 source of truth 旁边;拥抱动态、拒绝静态配置;投资可观测性;简单优先。</p>
+
+<h2 id="why-concurrency">2. 核心争论:为什么用 concurrency 不用 TPS</h2>
+
+<p>这是我花最多轮讨论、也是收获最大的部分。完整推导链:</p>
+
+<blockquote>
+机器的真实约束是<b>工作量/秒</b>(我的原始观点,正确)→ 但工作量在门口不可测(Uber 第一版给请求标价失败的原因)→ 工作量必然表现为<b>占用时长</b>(机器速度固定,活多的必然待得久)→ 占用时长可以在门口"数在场人数"来限制 → <b>所以限并发就是限工作量,计费方式从"事前预测"(做不到)变成"事后按时长自动结算"(免费)。</b>
+</blockquote>
+
+<p>数字验证:10 个座位,小请求占 1ms、大请求占 100ms。全是小请求时放行 10,000 个/秒,全是大请求时放行 100 个/秒——<b>个数差 100 倍,放进机器的工作量完全相同</b>。任何固定 TPS 做不到这种自适应。</p>
+
+<p>重要的边界(我提出的质疑,全部成立并对应架构组件):</p>
+<ul>
+<li>占座 ≠ 干活(等下游、等锁)→ 需要 regulators 补盲区</li>
+<li>constant N 在流量构成变化时非最优 → 需要 auto-tuner 动态找 N</li>
+<li>adaptive 本质是 reactive → 目标不是预测准,是误差有界 + 秒级自愈</li>
+</ul>
+
+<p><b>TPS 限流的正确位置:</b>数字是<b>政策</b>(配额/合同/防滥用)时就该 constant;数字是<b>容量估计</b>时才需要 adaptive。多数公司用"constant limit + 大余量 + autoscaling(动容量)"就够了;Uber 的存储是有状态的,容量短期焊死(扩 MySQL 分片要挪数据、以小时计),只能让准入变聪明——<b>stateless 动容量,stateful 动准入。</b></p>
+
+<h2 id="stations">3. 七站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站:等候区 —— 为什么光有计数器不够</h3>
+<p>流量是一阵一阵的,"满"往往只持续几毫秒。座位满直接拒 = 为一个 5ms 后自动消失的拥堵付出完整失败代价。队列的本质:<b>用几毫秒延迟换掉大量误杀,把"瞬间的满"和"真过载"区分开</b>。它是减震器,不是等候室——毒性(内存、backlog)由第 2 站的时间上限锁死。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站:按等待时间拒,不按队伍长度</h3>
+<p>拒人的尺子必须和被保护的东西<b>同单位</b>:调用方(同步阻塞,预算几百 ms)买单的是时间。队伍长度不含信息(同样 100 人,机器快时无害、机器病时致命);等待时间直接反映调用方耐心消耗,且<b>自动锁死内存</b>(队里最多站着"最近几 ms 到达的人")。</p>
+<p>判断拥堵的精巧细节:看最近窗口内<b>最幸运请求</b>的等待是否超标(连运气最好的都超了,拥堵才是结构性的)——用最小值抗噪,不用均值。</p>
+<p>设计手法:<b>能直接测量目标量,就绝不估算中间量</b>(不需要估算"处理速度",它的影响已全部灌进等待时间里)。</p>
+</div>
+
+<div class="station">
+<h3>第 3 站:过载时 FIFO → LIFO</h3>
+<p>过载时队头 = 等得最久 = 调用方预算几乎烧完 = 最接近死亡的请求。FIFO 的行为:把最宝贵的产能投资给最快过期的资产(做完答案没人要 = 无用功),同时让队尾新鲜请求排队变老。修复:检测到拥堵(复用第 2 站的信号)就翻转成后进先出;老请求由等待超时清走。<b>LIFO 保证产能喂活人,超时保证死人被清走。</b>过载时"对个体公平"让位给"存活工作价值最大化"。</p>
+</div>
+
+<div class="station">
+<h3>第 4 站:优先级 t0–t5</h3>
+<p>过载多由后台流量(管道/聚合/清理)引发,却砍到用户流量。修复:请求带优先级标签,t0(关键基础设施,保留档)/ t1(用户正在等的在线请求,真正的保护对象)/ … / t5(最不急的后台活)。过载时从 t5 逐层向上砍。平时全部机制休眠,人人平等(急诊分诊,不是贵宾通道)。</p>
+<p><b>标签怎么来:</b>档位语义中央定义、t0/t1 收紧;在 API 边缘按<b>业务流</b>集中配置(不是各服务自己贴);像 trace id 一样塞进请求上下文<b>沿调用链透传</b>(同一个共享存储,叫车链路的查询带 t1、报表任务的查询带 t5);没标签的按调用方给默认档。</p>
+<p><b>防通胀:</b>标签必须有价格。Amazon 的 ORR + bar raising 就是价格的现实实现——t1 是一摞签了字的义务,不是荣誉。治理层(月级,人)+ 执行层(纳秒级,透传)缺一不可。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站:三个自动环(本文的数学心脏)</h3>
+<p><b>环 1:PID 推水位线(追踪已知目标)。</b>先把 boolean 升级成有大小方向的误差:</p>
+<pre><code>误差 e = (实测等待 - 目标等待) / 目标等待
+
+调整量 u = Kp × 当前误差          ← P:看现在(超得越多砍得越狠)
+         + Ki × 历史误差累计       ← I:看过去(一直差一点,攒够就出手)
+         + Kd × 误差变化速度       ← D:看趋势(在好转就提前松手,防过冲)
+
+新砍人比例 p = 旧 p + u   (卡在 0%~100%)</code></pre>
+<p>三级传动把比例变成可执行的线:PID 推 p(如 26%)→ 查最近 1 秒流量成分直方图,从最低档累加到 26% → 水位线 = (档位, cohort 格号),如 (t4, 格32)。档内按调用方身份哈希分 128 格,保证同一调用方"要么正常要么干脆暂停",而非人人随机抽风。<b>慢环(500ms)画线,快路径(每请求,纳秒)只比大小。</b>拒绝发生在进门那一刻;直方图是"用刚过去 1 秒预测未来 500ms"——赌注极小、错了下一拍自动纠。</p>
+<p>PID 出身:1922 年 Minorsky 为军舰自动舵发明,把老舵手的手感(按偏航打舵/顶住洋流/提前回舵)翻译成数学。Uber 的贡献不是发明而是<b>识别同构</b>。注意 I 项要配遗忘机制(integral windup:记仇的项必须会过期)。</p>
+<p><b>环 2:目标等待 T_target 由 P90 自定。</b>"等多久算不正常"只相对于"这里的活平时要干多久"才有意义(1ms 单行读集群 vs 500ms 扫描集群不能用同一个数)。每台机器取自己最近请求耗时的 90 分位当基准。防反馈污染:喂标准的数据(干活时长)必须和要检测的病症(排队时长)不同源,再加绝对上限封顶。</p>
+<p><b>环 3:auto-tuner 找座位数 N(寻优未知峰顶)。</b>N 和吞吐是山形关系(太小吃不饱、过头互相踩踏),且峰会漂移——目标未知,PID 无从下手(PID 需要已知 setpoint + 单调旋钮),只能试探爬山。祖师爷是 TCP 的 AIMD:</p>
+<pre><code>没堵: 窗口 = 窗口 + 1      ← 朝危险方向蹑手蹑脚
+堵了: 窗口 = 窗口 × 0.5    ← 朝安全方向夺路而逃
+(错误代价不对称 → 步长不对称;到了峰顶仍 +1 = 持续付费买"峰在哪"的情报)</code></pre>
+<p>服务版用"延迟膨胀率"当坡度计(Netflix gradient 公式,Uber auto-tuner 同族):</p>
+<pre><code>新 N = 旧 N × (空载延迟 / 当前延迟) + 探测余量
+// 当前延迟 ≈ 空载延迟 → 比值≈1,轻轻上探
+// 延迟膨胀 2.5 倍 → 比值 0.4,大幅收缩(膨胀 = 内部在排队,Little's Law)</code></pre>
+<p><b>三环速度刻意错开</b>(纳秒规则层 / 500ms PID / 秒级 tuner):两个反馈环速度接近会互相追逐共振——环速错开是控制工程铁律。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站:两个配角 —— Scorecard 与 regulators</h3>
+<p><b>Scorecard(租户公平闸门):</b>写死的规则表,常年在岗:"每租户在本机各类操作最多同时占几个座"。全系统唯一<b>故意不自适应</b>的组件——它执行的是政策不是容量估计,契约的美德是恒定可解释。事故时肇事者自动现形、自动被关进自家院子。</p>
+<p><b>Regulators(专项保险丝):</b>补"占座≠干活"的盲区:写入字节(低频大写打满 I/O)、热点分区键、剩余内存、goroutine 数。各盯一个死角,平时永远沉默,越线熔断。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站:统一大脑 + BYOS</h3>
+<p>历史问题:远程信号由外挂 token bucket 处理,多个组件独立决策 → 脑裂(split-brain):互相不知情地重复砍、或把对方砍人的波动当新信号,追逐震荡。修复:只留一个决策点,所有信号(本地:排队/内存/写入量;远程:follower commit lag)<b>插件化</b>喂进同一个环。信号声明性质 → 系统性压力按优先级砍,某家作妖按肇事者精准掐。红利:可观测归一 + 加新信号零边际成本(rate limiter → load management <b>平台</b>)。</p>
+<p><b>commit lag 全链路:</b>quorum(3 副本 2 票提交)故意不等最慢 follower——好处是快,代价是最慢者可以无限落后而 leader 毫无感觉(冗余无声蒸发:表面 3 副本,实际容错不足 1 台)。信号免费:Raft leader 本来就维护 matchIndex[](不记就没法数票定提交线),落后量 = leader 最新编号 − matchIndex[B],一个减法,搭共识协议已有通信的便车,不新建任何全局组件。</p>
+</div>
+
+<h2 id="qa">4. 我的疑问与解惑</h2>
+<p style="color:var(--muted); font-size:.9rem;">按时间顺序记录我卡住的地方和解开的方式——这部分是这份笔记区别于原文的价值所在。</p>
+
+<div class="qa"><p class="q">Q1:用 max concurrency 而不是 max TPS 定容量,是行业标准吗?</p>
+<p class="a">过载保护领域是强共识(TCP 四十年先例、Netflix/Envoy/连接池),但不是唯一工具:TPS 限流统治政策/配额/边缘场景。concurrency 是闭环测量,TPS 是开环预测。</p></div>
+
+<div class="qa"><p class="q">Q2:我在 Amazon 做的"压 TPS 到延迟拐点"的 load test 错了吗?</p>
+<p class="a">没错,那是标准容量规划。错的是把快照当运行时阈值。拐点(knee)= 延迟曲线从平地陡然上翘的弯点;而 knee 处的 TPS × 延迟 = 并发容量,后者才是跨场景稳定的不变量。</p></div>
+
+<div class="qa"><p class="q">Q3:concurrency limit 有个大假设——资源真的受并发数约束吗?资源明明受工作量约束。</p>
+<p class="a">前提对,结论反转:正因为工作量事前不可测,才必须用"按占用时长自动结算"的并发槽。concurrency 不是资源,是可执行的代理:latency 是传感器,concurrency 是执行器。</p></div>
+
+<div class="qa"><p class="q">Q4:悖论——一个 slot 既能 serve 10ms 也能 serve 100ms 请求,不需要区别对待吗?</p>
+<p class="a">区别对待确实发生了,但在时间维度自动完成:大请求占座 10 倍久 = 被收 10 倍费。slot 恒定供应"占座时间",工作量恒定,个数自动浮动。</p></div>
+
+<div class="qa"><p class="q">Q5:停车场车位是 constant 的,长停日 serve 的车少,资源不是没用满吗?</p>
+<p class="a">混淆了"车次"和"车位·小时":长停日停车场同样 100% 满,资源全部卖出,只是给了更贪的客户。但"占座≠干活"时(等下游)质疑成立 → 所以 N 需要 auto-tuner 动态找。</p></div>
+
+<div class="qa"><p class="q">Q6:现实里 constant TPS 遍地都是,adaptive 很少见,怎么解释?</p>
+<p class="a">大多数 rate limit 干的是政策工作(配额/合同/防滥用),constant 是需求本身;干容量保护的多靠"余量 + autoscaling(动容量)"。adaptive 准入只在容量焊死(stateful)+ 规模大的地方成为必需。</p></div>
+
+<div class="qa"><p class="q">Q7:adaptive threshold 本质是 reactive,用现在预测未来,不准啊?</p>
+<p class="a">它不是预测器是恒温器:评价标准不是预测准,是误差有界 + 秒级自愈。static 的误差以周为单位靠人修,adaptive 以秒为单位自动修。且 concurrency 是"过期了也安全"的旋钮(座位计时效应兜底)。</p></div>
+
+<div class="qa"><p class="q">Q8:不用 Redis,全局计数怎么做?</p>
+<p class="a">全局计数被取消了:concurrency 被定义成每台机器的本地物理事实(内存里一个原子整数,+1/−1,精确免费)。全局效果 = 局部守门自然叠加(TCP 同款);真正的远程信号(commit lag)搭 Raft 已有通信便车。难题不是被解决的,是被重新定义掉的。</p></div>
+
+<div class="qa"><p class="q">Q9:用 token bucket 解决 burst 行不行?</p>
+<p class="a">不行:令牌按墙上的钟恒速入账(与机器死活无关,骨子里还是 constant TPS),且桶存款会把整个 burst 一次性砸进机器,然后急刹车——"猛灌-饿死"锯齿。队列按"有人干完离开"放行,被机器真实消化速度驱动。token bucket 解决的是政策世界的 burst(别误伤守约但突发的客户)。</p></div>
+
+<div class="qa"><p class="q">Q10:我不敢随便 queue request——MySQL 调用是同步的,而且 backlog 有连锁反应(retry storm、清 backlog 压垮下游)。</p>
+<p class="a">两条顾虑正是设计的两条边界:队列预算是几毫秒不是几秒(减震器);时间上限自动锁死内存。我的 OpenSearch 事故 = metastable failure 教科书(病因移除后故障靠 backlog+retry 自持;清 backlog = 重放昨天的高峰);最后的"老消息进 DLQ"= 手写了一个 CoDel。</p></div>
+
+<div class="qa"><p class="q">Q11:队头不是"等待时间最短"吗,马上就轮到它了?</p>
+<p class="a">队头距被服务最近,但已烧掉的预算最多(预算烧的是已等时间)。过载时服务队头 = 给剩 100ms 预算的请求做 150ms 的活,做到一半对方挂断。超市先卖临期酸奶是对的,但快递要 3 天时就不对了。</p></div>
+
+<div class="qa"><p class="q">Q12:P90 超标只是个 boolean,怎么推得动连续的水位线?</p>
+<p class="a">第 0 步先把 boolean 换成有大小方向的误差((实测-目标)/目标),之后 PID 三项 → 调整量 → 砍人比例 → 直方图换算 → (档,格) 水位线,全程连续。boolean 只能驱动开关(锤子),误差才能驱动比例(调光旋钮)。</p></div>
+
+<div class="qa"><p class="q">Q13:调整量怎么 translate 到 reject 标准?砍是在门口还是门内?</p>
+<p class="a">三级传动:调整量推状态变量 p → 查流量成分直方图把 26% 换算成 (t4, 格32) → 挂在门口。拒绝全部发生在进门瞬间(纳秒级比大小),进了队的人不被水位线赶出去;直方图用过去 1 秒预测未来 500ms,错了下一拍纠。</p></div>
+
+<div class="qa"><p class="q">Q14:所以不是进门的时候 reject,而是进门之后 reject?</p>
+<p class="a">拒绝就发生在进门瞬间,进了队的人不会被水位线赶出去。慢循环(每 500ms)回头看刚过去 1 秒的流量构成、画好线挂在门口;快路径对每个新到达的请求做一次比大小。"砍 26%"是个预测:<b>用已经发生的事情赌未来 500ms</b>——赌注极小、错了下一拍自动纠、代价有界。反馈控制的本质:把"做对一个大预测"换成"快速迭代一万个 500ms 的小赌注"。</p></div>
+
+<div class="qa"><p class="q">Q15:门口都直接拒了,那还搞个 LIFO 干嘛?</p>
+<p class="a">水位线是个慢家伙(500ms 一拍),两拍之间的空窗期——突发流量涌入、或机器突然变慢——队伍会真实堆起来,堆的全是"有资格进门"的请求。LIFO 零延迟、无需计算,给反馈环的滞后兜底:空窗期里保证产能不喂废品。分工:门口水位线管"量"(放多少进来),队内 LIFO 管"序"(进来的谁先上座)。快层笨而即时(规则),慢层聪明而滞后(反馈环)——汽车的 ABS + 定速巡航同款分层。</p></div>
+
+<div class="qa"><p class="q">Q16:是不是用 monitor 做 sampling 估算 processing speed,然后动态调节队列等待时间?</p>
+<p class="a">第一代连"估算"都不需要:阈值写死,但测的就是每个请求真实等了多久(进队盖时间戳,出队一减)——处理速度的变化自动灌进等待时间这个测量值,不需要算出这个中间量。<b>能直接测量目标量,就绝不估算中间量</b>(估算有模型误差、滞后、采样噪声;时间差精确实时免费)。"阈值本身也动起来"是第二代(P90)才做的事。</p></div>
+
+<div class="qa"><p class="q">Q17:不过载的时候还是 FIFO?</p>
+<p class="a">是。平时所有聪明零件全部休眠:队列几乎空、等待接近零、t5 和 t1 得到一模一样的服务。优先级不是"贵客永远走快速通道"的常态特权,而是急诊分诊——大规模伤亡事件发生那一刻规则才启动。好的保护机制像保险丝:99.99% 的时间里唯一的工作是隐形;平时容量够用时,任何聪明的排序都是纯开销。</p></div>
+
+<div class="qa"><p class="q">Q18:PID 公式他们自己想的?汽车巡航也是这个?</p>
+<p class="a">1922 年军舰自动舵,104 岁,九成工业控制回路是它;定速巡航是教科书案例(上坡=I 项攒账,坡顶过冲=integral windup)。Uber 的本事是识别同构:"测量量+旋钮+已知目标+单调+滞后" → 百年老解。目标已知用 PID(调节),目标未知用爬山(寻优)——N 属于后者。</p></div>
+
+<div class="qa"><p class="q">Q19:auto-tuner 找到最优 N 之后,为什么不停下来?(TCP 那个"永不停的 +1")</p>
+<p class="a">因为山峰会挪:流量构成一变,最优 N 就漂移;你若在峰顶坐下不动,容量悄悄涨了你永远不知道,只能永远用着过时的答案。TCP 的解法是<b>永不停止地 +1 试探</b>——用"偶尔撞一次墙"(丢一个包/多拒几个请求)的小代价,持续购买"峰顶现在在哪"的实时情报。<b>探测的成本,就是知识的价格。</b>配上不对称的步长(上探 +1 蹑手蹑脚,撞墙 ×0.5 夺路而逃——因为两个方向的错误代价不对称),就是跑了四十年的 AIMD。这是整个"static → adaptive"故事的最纯粹形态:没有一劳永逸的正确配置,只有持续重新发现正确配置的机制。</p></div>
+
+<div class="qa"><p class="q">Q20:优先级谁来定?我的想法:公司预定义 + 依赖树传播(Amazon tier 模型)。</p>
+<p class="a">对了一半:中央定义必须,但服务级标签在共享基础设施失效(同一个 Docstore 承载 t1 和 t5 流量)→ 升级为请求级标签沿调用链透传("为谁而做"而非"谁在执行")。防通胀靠给标签定价——Amazon 的 ORR/bar raising 正是价格的成熟实现,且"t1 的依赖也是 t1"在 ORR 下从福利下发变成连坐审查。</p></div>
+
+<div class="qa"><p class="q">Q21:commit lag 和 Raft 啥关系?leader 限速了 follower 自然轻松啊?而且 leader 不就发发心跳和 AppendEntries?</p>
+<p class="a">quorum 故意剪断了"最慢 follower 反压 leader"的绳子(2/3 票即提交,不等最慢者)——快的代价是落后可以无声积累、冗余悄悄蒸发。leader 必须维护 matchIndex[](不记就没法数票定提交线;给不同 follower 发不同日志段这个行为本身就证明在逐个记位置),落后量是一个减法,信号免费。</p></div>
+
+<h2 id="experience">5. 与我自己经验的连接</h2>
+<ul>
+<li><b>Amazon load test(压到 knee):</b>方法正确,产出是快照;knee 处的并发数才是跨场景稳定的不变量。下次可以验证:换流量构成重跑,TPS knee 会大挪、concurrency knee 基本不动。</li>
+<li><b>OpenSearch plugin 事故:</b>完整的 metastable failure 案例——plugin 抬高单请求成本(容量分母变了,所有按条数设的限全部失效)→ crash → 回滚无效(backlog+retry 自持回路)→ 新请求排在过期老请求后(FIFO 陷阱)→ 按年龄分流 DLQ 破局(手写 CoDel)。教训:给每条队列在设计之日配 TTL,预先切断自持回路。</li>
+<li><b>Amazon tier/ORR 体系:</b>治理层的成熟实现(给标签定价防通胀);Uber 文章补的是执行层(请求级透传)。两层拼起来才完整。</li>
+</ul>
+
+<h2 id="principles">6. 通用原则清单(可移植到任何系统)</h2>
+<div class="principle"><b>1. 决策放在信息所在地。</b>远程守门永远在猜,干活的机器直接知道。全局计数难题往往可以靠重选执行点定义掉。</div>
+<div class="principle"><b>2. 选自我校准的量。</b>concurrency 胜 TPS、等待时间胜队伍长度、P90 胜写死的 5ms、延迟膨胀率胜猜容量——每次二选一,赢的都是"机器变化自动灌进测量值"的那个。</div>
+<div class="principle"><b>3. 成本事前不可测时,按占用时长事后结算。</b>并发槽自动给贵的请求收贵的费,不需要任何人预测成本。</div>
+<div class="principle"><b>4. 政策 constant,容量 adaptive。</b>看到一个 limit 先问:这数字是合同还是容量估计?合同要恒定可解释,估计必须会自己动。</div>
+<div class="principle"><b>5. stateless 动容量(autoscale),stateful 动准入(adaptive shedding)。</b>负载 ≤ 容量这个不等式,两边挑一边动;容量焊死时只剩左边。</div>
+<div class="principle"><b>6. Fail fast,别把请求捏在内存里。</b>判得了的立刻判;backlog 是储存的需求,必然违约的债越滚越贵——每条队列设计之日就配 TTL。</div>
+<div class="principle"><b>7. 反馈不靠预测准取胜。</b>靠误差有界 + 快速自愈 + 错了也安全。把"做对一个大预测"换成"快速迭代一万个 500ms 的小赌注"。</div>
+<div class="principle"><b>8. 能直接测量目标量,就不估算中间量。</b>时间戳一减,胜过任何速度模型。</div>
+<div class="principle"><b>9. 错误代价不对称,步长就该不对称(AIMD)。</b>朝危险方向蹑手蹑脚,朝安全方向夺路而逃;峰顶仍要 +1——探测成本是知识的价格。</div>
+<div class="principle"><b>10. 记仇的项配遗忘机制。</b>积分/累计类状态必须会过期,否则病愈后旧账压着不放(integral windup)。</div>
+<div class="principle"><b>11. 快慢分层,环速错开。</b>快层笨而零延迟(规则:LIFO/比大小),慢层聪明而有滞后(反馈环);两环速度接近必共振。</div>
+<div class="principle"><b>12. 只留一个决策脑,信号插件化。</b>多个限流组件独立决策 = 脑裂;远程信息优先搭已有通信的便车(matchIndex),不新建上报系统。</div>
+<div class="principle"><b>13. 过载时,公平让位给存活价值最大化。</b>牺牲不可避免时,"牺牲谁"必须是显式决定(优先级),不能交给随机时机。</div>
+<div class="principle"><b>14. 目标已知 → PID;目标未知 → 爬山。</b>调节问题和寻优问题是两个物种,认错会翻车(单调性是 PID 的隐藏前提)。</div>
+<div class="principle"><b>15. 软件规模大了就是物理系统。</b>惯性、滞后、振荡、共振——处理它们的数学在隔壁自动化系躺了一百年,最聪明的一步是识别同构,不是发明新公式。</div>
+
+<h2 id="reading">7. 延伸阅读</h2>
+<ul>
+<li>Uber Cinnamon 系列博客(PID 实现细节与真实参数):"Cinnamon: Using Century Old Tech to Build a Mean Load Shedder" 及 auto-tuner 续篇</li>
+<li>CoDel 原始论文:Nichols &amp; Jacobson, "Controlling Queue Delay", ACM Queue 2012</li>
+<li>Netflix concurrency-limits(GitHub):gradient 算法,TCP 思路搬到服务层</li>
+<li>Amazon Builders' Library:David Yanacek, "Using load shedding to avoid overload"</li>
+<li>"Metastable Failures in Distributed Systems"(HotOS '21)——OpenSearch 事故的理论版</li>
+<li>Philipp Janert, <i>Feedback Control for Computer Systems</i>——控制论用于软件的入门书</li>
+</ul>
+
+<footer style="margin-top:3rem; padding-top:1rem; border-top:1px solid var(--border); color:var(--muted); font-size:.85rem;">
+深读笔记 · 2026-08-30 · 由 /deep-dive 工作流生成 · <a href="../index.html">← 返回目录</a>
+</footer>
+
+</div>
+</body>
+</html>

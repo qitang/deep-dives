@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Dives — 深读笔记目录</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 3rem 1.5rem; }
+  h1 { font-size: 1.8rem; border-bottom: 2px solid var(--accent); padding-bottom: .8rem; }
+  .sub { color: var(--muted); font-size: .92rem; margin-bottom: 2rem; }
+  .note {
+    display: block; background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem 1.3rem; margin: 1rem 0;
+    text-decoration: none; color: var(--fg); transition: border-color .15s;
+  }
+  .note:hover { border-color: var(--accent); }
+  .note .title { font-weight: 600; font-size: 1.05rem; color: var(--accent); }
+  .note .desc { font-size: .92rem; margin-top: .3rem; }
+  .note .meta { font-size: .8rem; color: var(--muted); margin-top: .4rem; }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .72rem; padding: .05em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📚 Deep Dives</h1>
+  <p class="sub">读 tech blog / 拆解 topic 的深读笔记。每篇记录:文章总结、机制拆解、我的疑问与解惑、经验连接、可移植的通用原则。由 <code>/deep-dive</code> 工作流生成。</p>
+
+  <!-- NOTES-LIST:START (新笔记加在最上面) -->
+  <a class="note" href="notes/2026-08-30-uber-intelligent-load-management.html">
+    <div class="title">Uber 智能负载管理:从静态限流到自适应过载控制</div>
+    <div class="desc">为什么用 concurrency 不用 TPS · CoDel/LIFO · 优先级 t0–t5 · PID 水位线 · AIMD 找 N · BYOS 统一引擎 · metastable failure</div>
+    <div class="meta"><span class="tag">文章拆解</span>2026-08-30 · 来源:Uber Engineering Blog</div>
+  </a>
+  <!-- NOTES-LIST:END -->
+
+</div>
+</body>
+</html>
