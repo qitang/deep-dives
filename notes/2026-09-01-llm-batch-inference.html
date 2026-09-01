@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Batch Inference 与权重搬运开销 — 深读笔记</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>LLM Batch Inference 与权重搬运开销:从显存物理到投机解码</h1>
+  <div class="meta">
+    <span class="tag">topic 拆解</span>
+    深读日期:2026-09-01 ·
+    起始问题:"LLM 的 batch inference 是干嘛的?为啥它和 model 的 weights load 开销有关系?"
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">Topic 总结</a></li>
+    <li><a href="#debate">核心争论:验证 5 个 token 为什么能并行</a></li>
+    <li><a href="#stations">七站机制拆解(+两条支线)</a></li>
+    <li><a href="#qa">我的疑问与解惑(本笔记最有价值的部分)</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. Topic 总结</h2>
+
+<p><b>一句话答案。</b>LLM 推理时,每生成一个 token 都必须把全部模型权重从显存搬进 GPU 计算核心一遍;这趟搬运垄断了推理时间(H100 上 70B 模型约 42ms/token),而真正的计算只占 0.3%——GPU 算力 99.7% 闲置。Batch inference 让 N 条请求共享同一趟权重搬运(N 条请求的当前 token 叠成矩阵一次算完),把这笔固定成本摊薄 N 倍。<b>它存在的唯一理由就是这个 weights load 开销;没有这个开销,batching 就没有必要。</b></p>
+
+<p><b>"weights load" 要先拆成两个含义。</b>含义 A:冷启动加载(磁盘 → 显存),只发生一次,几十秒。含义 B:每次计算时权重从显存(HBM)搬进 GPU 片上计算核心,<b>每个 token 重演一遍</b>。Batching 摊的主要是 B;离线 batch API(半价档)额外还摊了 A 和闲置产能。</p>
+
+<p><b>为什么每 token 要搬一遍(两个事实相乘):</b>① 生成是自回归的——第 N 个字依赖第 N−1 个字,每吐一个字都要完整跑一遍模型;② 跑一遍 = 每个权重参与一次乘加(矩阵乘法的定义),而片上缓存(~50MB SRAM)装不下 140GB 权重(差 3000 倍),留不住就只能每次重搬。这不是软件没写好,是 SRAM 密度的物理极限(1 bit 要 6 个晶体管 + reticle limit 858mm² 封死了芯片面积)。</p>
+
+<p><b>关键数字账(H100 + 70B fp16):</b></p>
+<pre><code>搬运时间 = 140 GB ÷ 3350 GB/s ≈ 42 ms
+计算时间 = 2 × 70B FLOP ÷ 1000 TFLOPS ≈ 0.14 ms   ← 快 300 倍
+GPU 平衡点 = 算力 ÷ 带宽 ≈ 每搬 1 字节配得起 300 次运算
+实际使用 = 每字节 1 次 → batch 加到 ~300 之前吞吐几乎白拿</code></pre>
+
+<p><b>但现实开不到 300:</b>每条请求要在显存养一份 KV cache(70B/GQA 下约 0.33MB/token,8k 上下文 ≈ 2.6GB/条),4×H100 留给 KV 的 ~160GB 只够 ~60 条。这解释了 GQA、KV 量化、PagedAttention 全家桶的存在——都是抬 batch 天花板。且 KV cache 本身每步也要被读,batch 大了搬运账单第二项(KV 总和)能追平权重,出字速度掉一半:<b>吞吐 vs 延迟的取舍就是便宜档 API vs 低延迟档的定价来源。</b></p>
+
+<p><b>系统层三件事:</b>continuous batching(每步换乘客保证班车满座,vLLM 吞吐提升数倍的最大来源);prefill/decode 分离(读 prompt 是并行的、吃算力,写回答是串行的、吃搬运,体质相反所以拆开调度甚至拆到不同机器,KV cache 走高速网络移交);离线 batch 档半价 = 摊含义 B + 摊含义 A + 填谷。</p>
+
+<p><b>同一个敌人的其他打法:</b>speculative decoding(小模型串行起草、大模型一趟并行批改,同一请求的 K 个位置摊一趟搬运,降单请求延迟 2–3 倍,输出与大模型独自生成严格等价);MoE(每 token 只走部分权重,减每趟货量);Groq/Cerebras 全 SRAM 芯片(权重常驻计算芯片,搬运消失,用几百颗芯片的成本买最快出字)。</p>
+
+<h2 id="debate">2. 核心争论:验证 5 个 token 为什么能并行</h2>
+
+<p>投机解码的"大模型一趟验证 5 个 token"是我卡得最久的地方,前后五轮。完整推导链:</p>
+
+<blockquote>
+token 永远是一个一个<b>生成</b>的(第 N 个字的输入依赖第 N−1 个字的输出,串行是数学结构不是实现缺陷)→ 但 transformer 一趟前向在<b>每个位置</b>各产出一个 next-token 预测(每个位置只看左边,训练时就是这么并行对损失的)→ 串行的根源不是"一次只能预测一个",而是"每个位置的<b>输入</b>必须已知"→ 普通 decode 时下一个输入恰好是上一个输出,所以被锁串行;prefill 时 prompt 已知,所以 2000 token 一趟读完 → 投机解码 = 小模型先把字<b>写在纸上</b>(伪造已知输入),大模型的验证步就变成了一小段 prefill → 每个位置的预测基于"左边草稿全对"的假设,假设崩了下游预测全是错误前提下的垃圾,必须扔 → 所以接受规则是归纳式:接受位置 i ⟺ 前 i−1 全接受 且 i 本身 match,即<b>取最长连续 ✓ 前缀 + 大模型自产的 1 个字</b>。
+</blockquote>
+
+<p>配套的经济账:批改 5 个字的成本(42ms,被权重搬运主宰)= 亲笔写 1 个字的成本;草稿全废的最坏情况只多亏小模型 3ms,五个全中收 6 个字——<b>下行封死 3ms,上行 6 倍,命中率 80% 时期望每轮 3.3 个字。</b>"猜错全废"不是漏洞,是明码标价且付得起的成本。</p>
+
+<h2 id="stations">3. 七站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站:"weights load" 拆成两个含义</h3>
+<p>含义 A:冷启动加载(磁盘 → 内存 → 过 PCIe 窄门 → 显存),一次性,几十秒。含义 B:每次计算时权重从显存搬进片上计算核心,<b>每 token 重演</b>。类比:A 是把百科全书从仓库<b>搬家</b>到图书馆;B 是每回答一个问题,管理员都得把全套书从书库推到阅览桌再推回去。Batching 的本质关系在 B。</p>
+<p><b>显存 vs 内存(支线):</b>物理上两块独立芯片。内存条服务 CPU(~100 GB/s);显存(HBM)焊在 GPU 芯片旁几毫米处服务 GPU(~3350 GB/s,上千根数据线,导线短所以频率高)。两边之间只有 PCIe 独木桥(~64 GB/s)。GPU 只能算显存里的数据。Apple Silicon 统一内存是例外(无独木桥,但带宽远低于 HBM)。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站:为什么每 token 都要搬全部权重</h3>
+<p>事实一:自回归——每吐一个字,输入完整流过每一层,生成 500 token = 跑 500 遍模型。事实二:跑一遍 = 每个权重被读进计算核心至少一次(矩阵乘法定义);想留住?片上缓存 50MB vs 权重 140GB,差 3000 倍,装不下。两者相乘:生成 500 token = 搬运 70TB。每个权重搬进来(2 字节)只参与 2 次运算就被扔掉。</p>
+<p><b>权重的构成(支线):</b>W_q/W_k/W_v 只占约 17%,前馈网络(FFN,升维-门控-降维三个大矩阵)占约 80%,词表约 3%。FFN 是搬运大头——这解释了 MoE 为什么砍 FFN:每 token 只激活一两个专家,大幅减每趟货量。</p>
+</div>
+
+<div class="station">
+<h3>第 3 站:算账 —— GPU 有多闲</h3>
+<pre><code>H100: 算力 ~1000 TFLOPS (fp16), 带宽 ~3.35 TB/s
+batch=1, 70B 模型每 token:
+  搬运 = 140GB ÷ 3350GB/s ≈ 42ms   (99.7%)
+  计算 = 0.14 TFLOP ÷ 1000 TFLOPS ≈ 0.14ms (0.3%)
+→ batch=1 出字速度硬上限 ≈ 24 token/s (带宽焊死)
+平衡点 = 1000 TFLOPS ÷ 3.35 TB/s ≈ 300 FLOP/byte
+实际 = 1 FLOP/byte → 差 300 倍,算力等于白送</code></pre>
+<p>"每字节配多少次运算"叫计算强度(arithmetic intensity),平衡点两侧分别是 memory-bound(搬运卡住)和 compute-bound(算力卡住)——roofline 模型的通俗版。</p>
+</div>
+
+<div class="station">
+<h3>第 4 站:batch inference —— 一趟搬运 N 份产出</h3>
+<p>N 条请求的当前 token 叠成 N 行矩阵,一次矩阵乘法全算完,数学上零近似。每 token 耗时 = max(42ms, N × 0.14ms):N &lt; 300 时搬运是瓶颈,加请求吞吐线性涨、延迟几乎不变(白拿);N &gt; 300 后算力饱和,大家一起变慢。本质 = SIMD 思想上移一层:SIMD 摊指令开销,batching 摊权重搬运开销——同一个"固定开销 amortize 到 N 份数据"的原理叠两层。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站:代价 —— KV cache 让 batch 开不到 300</h3>
+<pre><code>4×H100 = 320GB,权重占 140GB,留给 KV ≈ 160GB
+每 token KV (70B, GQA) ≈ 2×80层×1024维×2字节 ≈ 0.33MB
+8k 上下文一条请求 ≈ 2.6GB → 最大 batch ≈ 60 &lt;&lt; 300</code></pre>
+<p>抬天花板的技术:GQA(多头共享 k/v,省 8 倍,现代模型标配的真实动机)、KV 量化(8/4bit)、PagedAttention(按页分配消灭碎片,vLLM 成名作,实际 batch ×2–4)。第二个代价:每步搬运 = 权重 + 全体 KV 总和,batch=60 时 KV 项 ≈ 156GB 追平权重,每步 42ms → ~90ms,单用户出字变慢——吞吐 vs 延迟的取舍,即 API 定价分档的物理来源。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站:现实系统的调度</h3>
+<p><b>Continuous batching:</b>static batching 要求一桌客人同时离场(最长请求拖死全桌);continuous 把调度粒度降到单 token 步——每步(每趟 42ms 班车)之前重新点名,完者立刻下车释放 KV 显存,新客立刻上车。<b>它没省搬运(每步照样 140GB 全搬),省的是空座位</b>;逻辑方向是"反正每步都重搬 → 换乘客免费",不是反过来。</p>
+<p><b>Prefill/decode 分离:</b>prefill 并行、compute-bound;decode 串行、memory-bound。混在一个 batch 里,一条 8k prompt 的 prefill 会把 42ms 的一步撑到 300ms,所有 decode 用户卡顿。解法:chunked prefill(切块掺入)或 P/D 分离(两组机器,prefill 完把 KV cache 走高速网络移交给 decode 组,各按各的瓶颈扩容)。</p>
+<p><b>离线 batch API 半价的三层摊薄:</b>无延迟约束 → batch 开到显存极限(摊含义 B);任务连跑几小时 → 冷启动加载摊到千万请求 ≈ 0(摊含义 A);跑在流量低谷 → 用的是本就闲置的机器(填谷)。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站:支线 —— speculative decoding</h3>
+<p>batching 的对偶:只有一条请求时怎么榨干闲置算力。小模型(1B,每字 ~0.6ms)串行写 K 个字草稿 → 大模型一趟前向(42ms)并行批改(读已知输入,每位置出一个预测,逐位比对)→ 收最长连续 ✓ 前缀 + ✗ 处大模型自产的正确字。输出分布与大模型独自生成严格等价(小模型只影响速度不影响质量)。典型收益:单流延迟 2–3 倍。与 batching 互相挤兑:batch 打满后闲置算力消失,"验证免费"前提崩塌,所以它亮眼于低 batch 延迟敏感场景;内容越难猜(高温采样/创意写作)命中率越低收益越缩。</p>
+</div>
+
+<div class="station">
+<h3>第 8 站:支线 —— 为什么权重不能留在 GPU 里(芯片物理)</h3>
+<p>权重本来就常驻显存(GPU 卡上),每 token 重演的是<b>卡内部</b>显存芯片 → GPU 主芯片这段。留在主芯片里?SRAM 1 bit 要 6 晶体管(DRAM 只要 1 晶体管 + 1 电容),光刻 reticle limit 封死芯片 858mm²,H100 挤出 50MB 已经不易,140GB 需要几千倍面积——几何约束不是预算约束("一步之内"的空间装不下整个货架)。<b>但真有人硬干:</b>Groq(纯 SRAM 230MB/颗,几百颗串起来放一个 70B,权重零搬运,单流几百 token/s)、Cerebras(整张晶圆一颗芯片,44GB SRAM)。格局:GPU+HBM+batching 赢吞吐/成本,全 SRAM 赢单流延迟。<b>Batching 用软件摊薄搬运,Groq 用硬件消灭搬运——攻击的是同一个敌人。</b></p>
+</div>
+
+<h2 id="qa">4. 我的疑问与解惑</h2>
+<p style="color:var(--muted); font-size:.9rem;">按时间顺序记录我卡住的地方和解开的方式——这部分是这份笔记区别于任何教程的价值所在。</p>
+
+<div class="qa"><p class="q">Q1:显存是什么?和内存不一样吗?</p>
+<p class="a">物理上两块独立芯片:内存条服务 CPU(~100GB/s),显存焊在 GPU 旁几毫米服务 GPU(HBM ~3350GB/s,靠距离近 + 上千根数据线),中间只有 PCIe 独木桥(~64GB/s)。GPU 只能算显存里的数据。Mac 的统一内存是例外。</p></div>
+
+<div class="qa"><p class="q">Q2:所以 inference 的一个很大 overhead 是把 weights 从显存拿到 GPU 上?</p>
+<p class="a">对,而且 batch 小的时候占 95% 以上——GPU 大部分时间在等数据到货,不是在算。</p></div>
+
+<div class="qa"><p class="q">Q3:KV 不是有 cache 吗?(以为 KV cache 缓存了权重)</p>
+<p class="a">KV cache 存的是历史 token 的中间结果(k/v 向量,"会议记录"),不是权重("百科全书")。它省的是重算历史的<b>计算量</b>(N² → N);权重该搬还得搬,而且 KV cache 自己每步也要被读一遍——它不是搬运问题的解药,是账单上的第二项,还是限制 batch 的头号显存杀手。</p></div>
+
+<div class="qa"><p class="q">Q4:你说的这个是 kweights/qweights/vweights 吗?</p>
+<p class="a">W_q/W_k/W_v 是权重(固定,"记笔记的模板");q/k/v 是每个 token 现算的结果("写出的那张笔记")。KV cache 缓存的是后者。只缓存 k/v 不缓存 q:历史 token 的 k/v 未来每个新字都要用,q 用完一次就永远没人要了。</p></div>
+
+<div class="qa"><p class="q">Q5:model 的 weights 是不是就是 W_q/W_k/W_v?</p>
+<p class="a">只占 ~17%。八成重量在前馈网络(FFN)三个大矩阵上——它既是参数大头也是搬运大头,这就是 MoE 砍 FFN 的原因。</p></div>
+
+<div class="qa"><p class="q">Q6:所以 gist 就是每算一个 token 就要把 weights load 到 GPU 一次?</p>
+<p class="a">对,就是这把钥匙:生成 500 个 token,140GB 权重就流过计算核心 500 遍。</p></div>
+
+<div class="qa"><p class="q">Q7:这有点像 SIMD,一次计算好几个东西?(我的类比)</p>
+<p class="a">精准。同一原理不同层级:SIMD 摊"取指/解码一条指令"的固定开销,batching 摊"搬一遍权重"的固定开销。GPU 内部本来就是 SIMD 的极端体现,所以推理栈是同一思想叠两层。</p></div>
+
+<div class="qa"><p class="q">Q8:speculative decoding 是啥?</p>
+<p class="a">batching 的对偶问题:单条请求怎么用掉 99.7% 的闲置算力。小模型起草 K 个字,大模型一趟批改,收最长正确前缀。输出与大模型独自生成严格等价。</p></div>
+
+<div class="qa"><p class="q">Q9:没懂,token 不是一个一个生成的吗,怎么一次 predict 5 个?</p>
+<p class="a">缺了一块地基:transformer 一趟前向在<b>每个位置</b>各出一个 next-token 预测(每位置只看左边),训练时就是这么并行的。平时 decode 只用最后一个位置的预测,中间的全丢弃——投机解码捡回了这些被丢弃的预测。</p></div>
+
+<div class="qa"><p class="q">Q10:"输入 4 个 token 一起进"——你这说的是 training 的时候吧?</p>
+<p class="a">一半对:training 永远如此,但推理的 prefill 也是——证据就在使用体验里:2000 token 的 prompt 若只能逐个读,首字要 84 秒,实际一两秒。分界线从来不是 training vs inference,而是<b>输入已知 vs 输入未知</b>。投机解码的验证 = 用草稿伪造"已知输入",把一小段 decode 变成 prefill。</p></div>
+
+<div class="qa"><p class="q">Q11:我还是不懂,所以你说 token 不是一个一个生成的?</p>
+<p class="a">Token 永远一个一个<b>生成</b>,无例外。要分开的是两个动作:<b>写</b>(造新 token,串行,因为第 5 个字的输入即第 4 个字还不存在)和<b>读</b>(处理已存在的 token,可并行,因为要读的字都躺在那了)。投机解码里小模型在写(一个一个来),大模型在读(批改别人写好的,一趟 5 个)。魔术只有一句:批改 5 个字的成本 = 亲笔写 1 个字的成本,都是那趟 42ms。</p></div>
+
+<div class="qa"><p class="q">Q12:所以 read 的时候可以同时 produce 5 个预测,所以可以同时验证 5 个 token?(我的确认)</p>
+<p class="a">对。读 5 个已知 token,一趟前向在 5 个位置各出一个"下一个字"预测,逐位与草稿比对即完成验证。</p></div>
+
+<div class="qa"><p class="q">Q13:但如果第一个 token 就错了,后面生成的 token 就没意义?</p>
+<p class="a">正确,而且是明码标价的成本:最坏情况(第 1 个就 ✗)仍收 1 个字(大模型批改时顺手给出的正确答案),只比普通解码多亏小模型 3ms;最好情况一趟收 6 个。下行封死 3ms、上行 6 倍的不对称赌局,命中率 80% 时期望 3.3 字/轮。语言大部分是低悬果实所以命中率高;真正需要大智慧的字小模型猜错、被一票否决,恰是验证该拦的地方。</p></div>
+
+<div class="qa"><p class="q">Q14:验证的时候,大模型还是要先 predict 第 1 个 token、比较,然后第 2 个也一样?(以为验证是串行)</p>
+<p class="a">不用等。预测位置 2 用的不是"自己验证过的第 1 个字",而是"纸上写的第 1 个字"——每个位置的工人只需要左边纸上写了什么(已知),不需要任何其他工人的产出,所以全体同时开工;比对是前向结束后的纯查表。位置 2 的预测建立在"草稿第 1 字是对的"假设上,假设崩了就是错误前提下的垃圾,扔掉——扔的是免费的闲置算力,昂贵的搬运只发生一次。这就是 speculative(投机)的确切含义,和 CPU 分支预测同构。</p></div>
+
+<div class="qa"><p class="q">Q15:只有所有 next token 都 match 才会使用?而且有递归思想——第二个 match imply 第一个 match?</p>
+<p class="a">两处修正:① 不是 all-or-nothing,是部分接受(最长连续 ✓ 前缀 + 1);全对才用的话 33% 概率太低,方案不成立。② 链式结构存在但方向反了:match 与否各位置独立(可能出现 ✗✓),链条传递的是"这个 match 算不算数"——位置 i 的 ✓ 有效 ⟺ 前 i−1 全被接受。信任从左往右单向传播,断在第一个 ✗。同 Raft 日志匹配:一致性只能从前缀延伸,中间断一截的"碰巧相同"不作数。</p></div>
+
+<div class="qa"><p class="q">Q16:decode 就是 predict next token 的意思吗?</p>
+<p class="a">decode 是"预测 → 采样 → 拼回输入 → 再预测"这个循环阶段的名字,每步 = 一趟前向 + 一个字。名字来历:① GPT 是砍掉 encoder 只留 decoder 的架构;② 每步原始输出是词表上几万个候选的概率分布,从分布"解码"出一个具体字(采样)。</p></div>
+
+<div class="qa"><p class="q">Q17:为啥不能算完一个 token 之后直接把 weight 留在 GPU?</p>
+<p class="a">先澄清:权重一直在 GPU 卡上(显存),每 token 重演的是卡内部显存 → 主芯片那段。留在主芯片?SRAM 密度物理极限(1bit 6 晶体管)+ reticle limit 858mm² → 片上只有 50MB,差 3000 倍。但这个直觉完全正确到成了两家公司的商业模式:Groq(几百颗纯 SRAM 芯片,权重常驻,零搬运,单流快近一个数量级)和 Cerebras(整晶圆芯片)。batching 用软件摊薄搬运,它们用硬件消灭搬运。</p></div>
+
+<div class="qa"><p class="q">Q18:那为啥 continuous batching 就不需要完整的 weights?(误解)</p>
+<p class="a">它完全没省搬运——每步照样 140GB 全搬,一克不少。逻辑方向要摆正:不是"continuous batching → 不需要完整搬权重",而是"每步反正都要完整重搬 → 换乘客免费"。它省的是空座位:班车到点就发(42ms/趟油钱固定),static batching 让早到站的乘客占着座陪跑,continuous 每站开门换客保证满员。没有任何软件方案能让某一步不搬完整权重(MoE 除外,但那是改了模型结构)。</p></div>
+
+<div class="qa"><p class="q">Q19:明白了,他是 amortize weight load 的 cost。(收束)</p>
+<p class="a">一个词就是它。LLM 推理优化的半壁江山 = 围绕这笔固定成本怎么摊:batching 摊到 N 条请求、continuous batching 保证 N 最大、speculative decoding 摊到同一请求的 K 个位置、MoE 减每趟货量、Groq 釜底抽薪。</p></div>
+
+<h2 id="experience">5. 与我自己经验的连接</h2>
+<ul>
+<li><b>SIMD(我自己提出的类比):</b>batching 就是 SIMD 原理上移一层——SIMD 摊指令取指/解码开销,batching 摊权重搬运开销。同一个"固定开销 amortize 到 N 份数据"的抽象。</li>
+<li><b>CPU 分支预测:</b>speculative decoding 与它同构——基于未证实的假设先干活(闲置资源免费),猜错清空流水线重来,清空成本远小于干等。"speculative" 这个词在两处是同一个含义。</li>
+<li><b>Raft 日志匹配:</b>投机解码的前缀接受规则(位置 i 有效 ⟺ 前 i−1 全被接受)与 Raft 的日志一致性同构:一致性只能从前缀往后延伸,中间断一截的"碰巧相同"不作数。信任单向传播。</li>
+<li><b>容量规划直觉:</b>memory-bound vs compute-bound 的平衡点(300 FLOP/byte)本质是和做后端容量规划时找瓶颈资源一样的算法:两个资源各自的天花板,谁先撞谁定价。</li>
+</ul>
+
+<h2 id="principles">6. 通用原则清单(可移植到任何系统)</h2>
+<div class="principle"><b>1. 固定开销躲不掉,就摊薄它(amortize)。</b>SIMD 摊指令、batching 摊权重搬运、离线任务摊冷启动——同一招在三个尺度反复出现。</div>
+<div class="principle"><b>2. 先分清瓶颈是搬运还是计算(memory-bound vs compute-bound)。</b>算力 ÷ 带宽 = 平衡点;工作负载的"每字节运算数"落在平衡点哪一侧,决定了所有优化的方向——优化错侧的资源是纯浪费。</div>
+<div class="principle"><b>3. 闲置资源接近免费,拿它去赌。</b>speculative decoding 和分支预测都是:用免费的闲置算力做基于假设的投机,错了扔掉,赌注下行有界。</div>
+<div class="principle"><b>4. 串行的根源是数据依赖,不是操作本身。</b>"写"串行是因为下一步输入依赖上一步输出;补齐输入(草稿/prompt),同样的操作立刻可并行。攻击依赖而不是攻击操作。</div>
+<div class="principle"><b>5. 分清"生成"与"处理"、"预测"与"验证"。</b>验证已知答案几乎总是比生成答案更可并行(P vs NP 的日常版)。</div>
+<div class="principle"><b>6. 基于假设的并行结果,有效性沿依赖链单向传播。</b>前提崩塌则下游作废,哪怕碰巧"正确";接受规则必然是前缀式的(Raft 日志、投机解码、CPU 流水线清空,同一条规则)。</div>
+<div class="principle"><b>7. 调度粒度越细,资源利用越满。</b>static → continuous batching 的全部收益 = 把调度单位从"整条请求"降到"单个 token 步"。看到利用率低,先问调度粒度能不能再切细。</div>
+<div class="principle"><b>8. 体质相反的负载要拆开。</b>prefill(吃算力)和 decode(吃带宽)混跑互相伤害;P/D 分离 = 按瓶颈类型分池,各自扩容。</div>
+<div class="principle"><b>9. 缓存要先问"存的是什么、省的是什么"。</b>KV cache 省计算不省搬运,自己还是显存大户——一个叫 cache 的东西完全可能是资源的消耗方而非节约方。</div>
+<div class="principle"><b>10. 吞吐和延迟是一条曲线上的两个卖点。</b>batch 大→吞吐/成本优(便宜档),batch 小→延迟优(贵档);定价分档往往直接映射一个物理取舍。</div>
+<div class="principle"><b>11. 软件摊薄 vs 硬件消灭,是同一个瓶颈的两条商业路线。</b>GPU+batching 和 Groq 全 SRAM 攻击同一个敌人;判断一家硬件公司的赛道,先找它消灭了哪项搬运。</div>
+<div class="principle"><b>12. 物理约束(SRAM 密度、reticle limit、导线长度)是架构分歧的最终解释。</b>问到"为什么不把 X 做大"时,答案常在晶体管经济学,不在软件。</div>
+
+<h2 id="reading">7. 延伸阅读</h2>
+<ul>
+<li>vLLM / PagedAttention 论文:Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023)</li>
+<li>Continuous batching 原始论文:Yu et al., "Orca: A Distributed Serving System for Transformer-Based Generative Models" (OSDI 2022)</li>
+<li>Speculative decoding:Leviathan et al., "Fast Inference from Transformers via Speculative Decoding" (ICML 2023);Chen et al., "Accelerating Large Language Model Decoding with Speculative Sampling" (DeepMind, 2023)</li>
+<li>Roofline 模型直觉入门:Horace He, "Making Deep Learning Go Brrrr From First Principles" (horace.io/brrr_intro.html)</li>
+<li>推理算术账:Kipply, "Transformer Inference Arithmetic" (kipp.ly 博客)——每 token 搬运/计算账的更完整版本</li>
+<li>P/D 分离:Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving" (OSDI 2024)</li>
+<li>GQA:Ainslie et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints" (2023)</li>
+<li>Groq LPU 架构:Abts et al., "A Software-defined Tensor Streaming Multiprocessor for Large-scale Machine Learning" (ISCA 2022)</li>
+</ul>
+
+<footer style="margin-top:3rem; padding-top:1rem; border-top:1px solid var(--border); color:var(--muted); font-size:.85rem;">
+深读笔记 · 2026-09-01 · 由 /deep-dive 工作流生成 · <a href="../index.html">← 返回目录</a>
+</footer>
+
+</div>
+</body>
+</html>
