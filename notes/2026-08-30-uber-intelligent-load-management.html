@@ -90,6 +90,7 @@
   <b>目录</b>
   <ol>
     <li><a href="#summary">文章总结</a></li>
+    <li><a href="#e2e">一个请求的完整旅程(end to end)</a></li>
     <li><a href="#why-concurrency">核心争论:为什么用 concurrency 不用 TPS</a></li>
     <li><a href="#stations">七站机制拆解</a></li>
     <li><a href="#qa">我的疑问与解惑(本笔记最有价值的部分)</a></li>
@@ -117,7 +118,55 @@
 
 <p><b>文章的 lessons:</b>优先级是第一位的;fail fast 别憋着;PID 让 shedding 平滑;控制放在 source of truth 旁边;拥抱动态、拒绝静态配置;投资可观测性;简单优先。</p>
 
-<h2 id="why-concurrency">2. 核心争论:为什么用 concurrency 不用 TPS</h2>
+<h2 id="e2e">2. 一个请求的完整旅程(end to end)</h2>
+<p style="color:var(--muted);font-size:.9rem;">2026-09-11 补写。原总结按时间线讲了"有哪些零件",没讲一个请求进来之后按什么顺序碰到它们。以下按 Cinnamon 时代(二代/三代)的路径写,细节部分参照了 Uber 2023 年专讲 Cinnamon 的系列博客。</p>
+
+<p><b>0. 前提:所有控制都在 storage node 上,按 partition 的 leader 逐个执行。</b>Router 层无状态,只做解析和路由。每个节点用的是<b>基于并发数的限流</b>(同时在处理几个请求),不是 TPS:请求的成本事前不可知,并发槽按"占用时长"自动结算,大请求自然多付费。</p>
+
+<p><b>1. 到达,带 priority tag。</b>请求带着 t0–t5 的 tier 到达(t0 infra、t1 用户正在等的请求、t5 离线/报表/重试),标签由 caller 服务或请求元数据决定,storage node 不猜。</p>
+
+<p><b>2. Scorecard:按 tenant 查 in-flight quota。</b>这个 tenant 在本节点上<b>已接收、尚未返回</b>的请求数(排队中 + 执行中)是否超过它自己的上限,超了当场拒,只拒它,不看系统忙不忙、不看 tier、不看 P90。这是"按肇事者砍"那条路径。quota 是<b>静态配置</b>的规则表(图 6 "Scorecard rules"),三个 rejection point 里唯一静态的一个,原因见原则 16。<span style="color:var(--muted);">(原文只说 "concurrency limits",未明确是否含排队中的请求;按其隔离目的推断为含。)</span></p>
+
+<p><b>3. Rejector:enqueue 之前,按 tier 砍掉一个比例。</b>这是主力 rejection point。后台 PID controller 盯着队列的 <b>inflow 和 outflow</b>,进多出少说明在积压,就调高"本轮该砍的比例";队列清空后再慢慢降。<b>PID 只维护这一个量</b>(砍的比例),队列的 wait time threshold 和 in-flight limit N 分别由另外两个机制管,见第 5、6 步。比例也不是随机概率:30% 意味着算出一条 cutoff,让低于它的那确定的 30% 流量被拒。Rejector 拿到比例后,用最近各 tier 的流量占比算出一条 cutoff(落在某个 tier 的某个 cohort),优先级低于 cutoff 的当场拒,高于的 enqueue。因为 cutoff 从 t5 往上滑,砍的永远是最不重要的那部分;tier 内再按 caller hash 分 cohort,同一个用户要么全过要么全拒,不会一半一半。</p>
+
+<p><b>4. enqueue:两个 in-memory priority queue。</b>只按读、写分两个队列(重要性已由 tier 表达,不再按业务分队列)。队列内 dequeue 顺序按优先级,t1 永远先于 t4 被处理。</p>
+
+<p><b>5. 队列超时:enqueue 之后的兜底。</b>每个请求记着到达时间。等待超过 threshold 的被清掉,threshold 不是配置,是<b>跟随最近 window 内实测的 P90 latency</b>:</p>
+<pre><code>threshold(现在) = k × P90( 最近 window W 内已完成请求的 latency)
+拒绝条件:  现在 − 到达时间 > threshold
+
+原理:arrival rate ≤ throughput 时,一个请求最多等"一个处理时间";
+     等得比这更久 = 队列在积压 = 需求已超容量,多处理一个也不会更好。
+     取 P90 而不是均值,是给正常的慢请求留余量,不误判。
+     用旧 window 不是"预测",是"最近一次测量",threshold 滞后真实情况一个 window。</code></pre>
+<p>这个 threshold 没有反馈环,不经过 PID:它只是在描述"处理一个请求大概要多久",直接测就行;PID 用在"有目标要逼近"的地方(让 inflow 等于 outflow)。正常情况下 rejector 已经砍够,这一层几乎不触发;它防的是"放进来之后 throughput 突然掉了"。<br><b>FIFO/LIFO 与 tier 的关系:</b>tier 之间始终按优先级 dequeue,t1 永远先于 t4;FIFO/LIFO 只决定<b>同一 tier 内</b>取最老的还是最新的。检测到积压时切 LIFO,让还来得及的新请求先走,老的由超时清掉。一代 CoDel 的切换判据是"最近 window 内等得最少的请求也超过 target"(连最幸运的都在等,积压是结构性的);Cinnamon 时代是否沿用此判据,原文未明说,且 rejector 已在门口控量,队列内积压少,LIFO 作用比一代小。</p>
+
+<p><b>6. Scheduler:出口按 in-flight limit N 放行。</b>N 由 auto-tuner 动态找:看整体吞吐和延迟,加法慢慢涨、延迟恶化时乘法砍,停在吞吐最高的那个 N。放行的请求执行,in-flight 计数 +1,结束 −1。</p>
+
+<p><b>7. 旁路信号:regulators 与 BYOS。</b>四个节点本地 regulators(写字节、热点 key、内存、goroutine 数)平时几乎不触发,触发时作为 overload signal 喂进同一个 control loop;远程信号(follower commit lag)通过 BYOS 插件同样喂进来。统一引擎按信号性质分流:<b>系统性压力 → 走 rejector 按 tier 砍;某个 tenant 作恶 → 走 Scorecard 只砍它。</b></p>
+
+<p><b>三个可调的量,三个不同的机制</b>(纠正本文原句"PID adjusts queue timeouts and inflight limits"给人的印象,按 2023 年 Cinnamon 系列原文):</p>
+<table>
+<tr><th>可调的量</th><th>谁在调</th><th>输入</th><th>怎么调</th></tr>
+<tr><td>砍掉的比例 → tier cutoff</td><td><b>PID controller</b></td><td>队列 inflow vs outflow</td><td>进多出少就升,清空后慢慢降</td></tr>
+<tr><td>队列 wait time threshold</td><td>统计跟随,非 PID</td><td>最近 window 的 P90 latency</td><td>threshold = k × P90(2023 年系列里还是固定的"request timeout 的 33%",本文才改为跟随 P90)</td></tr>
+<tr><td>in-flight limit N</td><td>auto-tuner</td><td>整体吞吐 + latency</td><td>加法慢涨,恶化时乘法砍</td></tr>
+</table>
+
+<table>
+<tr><th>rejection point</th><th>时机</th><th>依据</th><th>角色</th></tr>
+<tr><td>Scorecard</td><td>enqueue 前</td><td>tenantin-flight quota</td><td>隔离肇事者,常态也生效</td></tr>
+<tr><td>Rejector</td><td>enqueue 前</td><td>PID 比例 → tier/cohort cutoff</td><td><b>主力</b>,绝大多数 shedding 在此</td></tr>
+<tr><td>队列超时</td><td>enqueue 后、执行前</td><td>等待 > k × P90 latency(统计跟随,非 PID)</td><td>兜底,防形势突变</td></tr>
+</table>
+
+<pre><code>到达(带 tier) → Scorecard(tenant 配额) → Rejector(PID 比例,按 tier 砍) → 读/写 priority queue
+    → 等待超过 P90 threshold 的清掉(过载时 LIFO) → Scheduler(in-flight limit N,auto-tuner 调) → 执行
+                    ↑ regulators / follower lag 通过 BYOS 喂进同一 control loop</code></pre>
+
+<p style="color:var(--muted);font-size:.9rem;">标注:Scorecard 位于 rejector 之前、regulators 与队列并行,这两处顺序是按组件职责推出的,两篇原文均未明说。tier 内 cohort 的具体数量未核实。</p>
+
+<h2 id="why-concurrency">3. 核心争论:为什么用 concurrency 不用 TPS</h2>
 
 <p>这是我花最多轮讨论、也是收获最大的部分。完整推导链:</p>
 
@@ -136,7 +185,7 @@
 
 <p><b>TPS 限流的正确位置:</b>数字是<b>政策</b>(配额/合同/防滥用)时就该 constant;数字是<b>容量估计</b>时才需要 adaptive。多数公司用"constant limit + 大余量 + autoscaling(动容量)"就够了;Uber 的存储是有状态的,容量短期焊死(扩 MySQL 分片要挪数据、以小时计),只能让准入变聪明——<b>stateless 动容量,stateful 动准入。</b></p>
 
-<h2 id="stations">3. 七站机制拆解</h2>
+<h2 id="stations">4. 七站机制拆解</h2>
 
 <div class="station">
 <h3>第 1 站:等候区 —— 为什么光有计数器不够</h3>
@@ -164,6 +213,7 @@
 
 <div class="station">
 <h3>第 5 站:三个自动环(本文的数学心脏)</h3>
+<p style="color:var(--muted); font-size:.9rem; border-left:3px solid var(--q-border); padding-left:.6rem;"><b>2026-09-11 更正:</b>下面环 1 写的"误差 = 实测等待 − 目标等待"是 8 月 30 日的推断,与 Cinnamon 系列原文不符。原文:"it monitors the inflow and outflow of requests into the priority queue... Based on these numbers, it uses a PID controller to determine a ratio of requests to shed." 即 <b>PID 的输入是 inflow vs outflow,目标是两者相等</b>;PID 只输出砍的比例这一个量。队列 timeout 在 2023 年系列里是"正常 request timeout 的 33%",到 2026 年本文才改为跟随 P90 latency,且它不经过 PID。环 2、环 3 的内容不受影响。详见第 2 节和 Q23/Q26。</p>
 <p><b>环 1:PID 推水位线(追踪已知目标)。</b>先把 boolean 升级成有大小方向的误差:</p>
 <pre><code>误差 e = (实测等待 - 目标等待) / 目标等待
 
@@ -198,7 +248,7 @@
 <p><b>commit lag 全链路:</b>quorum(3 副本 2 票提交)故意不等最慢 follower——好处是快,代价是最慢者可以无限落后而 leader 毫无感觉(冗余无声蒸发:表面 3 副本,实际容错不足 1 台)。信号免费:Raft leader 本来就维护 matchIndex[](不记就没法数票定提交线),落后量 = leader 最新编号 − matchIndex[B],一个减法,搭共识协议已有通信的便车,不新建任何全局组件。</p>
 </div>
 
-<h2 id="qa">4. 我的疑问与解惑</h2>
+<h2 id="qa">5. 我的疑问与解惑</h2>
 <p style="color:var(--muted); font-size:.9rem;">按时间顺序记录我卡住的地方和解开的方式——这部分是这份笔记区别于原文的价值所在。</p>
 
 <div class="qa"><p class="q">Q1:用 max concurrency 而不是 max TPS 定容量,是行业标准吗?</p>
@@ -264,14 +314,36 @@
 <div class="qa"><p class="q">Q21:commit lag 和 Raft 啥关系?leader 限速了 follower 自然轻松啊?而且 leader 不就发发心跳和 AppendEntries?</p>
 <p class="a">quorum 故意剪断了"最慢 follower 反压 leader"的绳子(2/3 票即提交,不等最慢者)——快的代价是落后可以无声积累、冗余悄悄蒸发。leader 必须维护 matchIndex[](不记就没法数票定提交线;给不同 follower 发不同日志段这个行为本身就证明在逐个记位置),落后量是一个减法,信号免费。</p></div>
 
-<h2 id="experience">5. 与我自己经验的连接</h2>
+<p style="color:var(--muted); font-size:.9rem; margin-top:1.5rem;">2026-09-11 重读时的追问:</p>
+
+<div class="qa"><p class="q">Q22:内部队列大小是多少?</p>
+<p class="a">文章没给,而且这是设计使然:CoDel 一族不用队列长度做控制量,用"已经等了多久"。长度和体验之间没有稳定关系(同样 100 个请求,机器快时 10ms 清空,慢时等 3 秒),等待时间才直接对应 caller 感受。实现上一般仍有一个上限防内存爆,但它是保险丝不是控制量。加上 rejector 在门口已按比例砍过,能进来的量本身就是"当前处理能力放得下"的。</p></div>
+
+<div class="qa"><p class="q">Q23:threshold 是怎么动态调整的?"用旧 window 预测新 threshold"是什么意思?</p>
+<p class="a">它不是预测,是跟随。threshold = k × 最近 window 内实测的 P90 latency。第一性原理:arrival rate ≤ throughput 时一个请求最多等一个处理时间,等得更久就是积压;处理时间不是常数所以要测,能测到的只有已完成的请求。代价是 threshold 滞后真实情况一个 window:系统突变的头几秒按旧 threshold 判,是抖动就是误杀、是新常态就是正确的 fail fast,window 长度就是在赌这两者哪个更常见。我一开始把"多杀"说成了坏事,其实方向不定。</p></div>
+
+<div class="qa"><p class="q">Q24:我记得 reject 是在 enqueue 之前发生的,和"等待超时"不矛盾吗?</p>
+<p class="a">我记对了,而且这是主力。Cinnamon 有两个 rejection point:rejector 在 enqueue 前按 PID 比例砍(绝大多数拒绝在这里),队列超时在 enqueue 后兜底(防放进来之后 throughput 掉了)。原文这篇没写清,是 2023 年 Cinnamon 系列博客的原句:"Next it enters the rejector that figures out whether we should reject the request or not... In cases where too many requests are queued,they will time out from the queue." 另外 PID 的输入在原系列里是队列的 inflow/outflow,不是延迟。</p></div>
+
+<div class="qa"><p class="q">Q25:tier 0–5 是怎么参与工作的?rejector 也按 tier 拒吗?</p>
+<p class="a">是。PID 只给一个标量(砍多少),tier 把它变成确定性的决定(砍谁):rejector 统计最近各 tier 流量占比,从 t5 往上累加到比例为止,cutoff 落在某个 tier 内部;tier 内再按 caller hash 分 cohort,cutoff 落在哪一格那一格全拒,同一用户命运一致。队列本身也是按优先级 dequeue 的内存结构,只分读写两个。不按 tier 拒的只有 Scorecard,它按 tenant 配额拒。</p></div>
+<div class="qa"><p class="q">Q26:enqueue 时的 rejection 和队列里的 timeout 逻辑不一样?PID 是不是维护两个 threshold?</p>
+<p class="a">不一样,而且 PID 只维护一个。Rejector 回答"接下来放多少、放谁",看整体 inflow/outflow,输出一条 tier cutoff,由 PID 驱动;timeout 回答"这一个请求是否已等太久",看它自己的到达时间 vs k × P90 latency,是统计跟随,没有反馈环。in-flight limit N 是第三个量,由 auto-tuner 管。我之前被本文"PID adjusts queue timeouts and inflight limits"一句带偏,说成 PID 输出两个量,已纠正。另外比例不是随机概率,是确定性的 cutoff。核对 Cinnamon 系列原文后,第 5 站环 1 写的"误差 = 等待时间差"也是错的,已在第 5 站顶部加更正。</p></div>
+
+<div class="qa"><p class="q">Q27:什么时候切 LIFO?FIFO 模式和 tier 怎么一起工作?</p>
+<p class="a">tier 之间永远按优先级 dequeue,FIFO/LIFO 只在同一 tier 内部起作用。一代 CoDel 的切换判据是"window 内等得最少的请求也超过 target";Cinnamon 时代原文只说"under pressure it switches to LIFO",判据未写明,且门口 rejector 已控量,LIFO 的实际作用比一代小得多。</p></div>
+
+<div class="qa"><p class="q">Q28:Scorecard 的上限是 queued 请求数吗?是按 P90 拒的吗?最新一代也有 static threshold?</p>
+<p class="a">上限是该 tenant 已接收未返回的请求数(排队中 + 执行中,原文未明确,按隔离目的推断)。与 P90 无关,P90 只参与队列 timeout 这一个地方。是的,Scorecard 的 quota 是三个 rejection point 里唯一静态的,而且是故意的:它管的是"谁能用多少"这个政策问题,不是"系统撑不撑得住"这个物理问题,政策只能配。见原则 16。</p></div>
+
+<h2 id="experience">6. 与我自己经验的连接</h2>
 <ul>
 <li><b>Amazon load test(压到 knee):</b>方法正确,产出是快照;knee 处的并发数才是跨场景稳定的不变量。下次可以验证:换流量构成重跑,TPS knee 会大挪、concurrency knee 基本不动。</li>
 <li><b>OpenSearch plugin 事故:</b>完整的 metastable failure 案例——plugin 抬高单请求成本(容量分母变了,所有按条数设的限全部失效)→ crash → 回滚无效(backlog+retry 自持回路)→ 新请求排在过期老请求后(FIFO 陷阱)→ 按年龄分流 DLQ 破局(手写 CoDel)。教训:给每条队列在设计之日配 TTL,预先切断自持回路。</li>
 <li><b>Amazon tier/ORR 体系:</b>治理层的成熟实现(给标签定价防通胀);Uber 文章补的是执行层(请求级透传)。两层拼起来才完整。</li>
 </ul>
 
-<h2 id="principles">6. 通用原则清单(可移植到任何系统)</h2>
+<h2 id="principles">7. 通用原则清单(可移植到任何系统)</h2>
 <div class="principle"><b>1. 决策放在信息所在地。</b>远程守门永远在猜,干活的机器直接知道。全局计数难题往往可以靠重选执行点定义掉。</div>
 <div class="principle"><b>2. 选自我校准的量。</b>concurrency 胜 TPS、等待时间胜队伍长度、P90 胜写死的 5ms、延迟膨胀率胜猜容量——每次二选一,赢的都是"机器变化自动灌进测量值"的那个。</div>
 <div class="principle"><b>3. 成本事前不可测时,按占用时长事后结算。</b>并发槽自动给贵的请求收贵的费,不需要任何人预测成本。</div>
@@ -286,11 +358,12 @@
 <div class="principle"><b>12. 只留一个决策脑,信号插件化。</b>多个限流组件独立决策 = 脑裂;远程信息优先搭已有通信的便车(matchIndex),不新建上报系统。</div>
 <div class="principle"><b>13. 过载时,公平让位给存活价值最大化。</b>牺牲不可避免时,"牺牲谁"必须是显式决定(优先级),不能交给随机时机。</div>
 <div class="principle"><b>14. 目标已知 → PID;目标未知 → 爬山。</b>调节问题和寻优问题是两个物种,认错会翻车(单调性是 PID 的隐藏前提)。</div>
+<div class="principle"><b>16. 政策静态,感知动态。</b>"系统现在撑不撑得住"是物理事实,只能测不能配(rejector / timeout / auto-tuner 全动态);"一个 tenant 最多能占多少"是人定的政策,没有物理量可测,只能配(Scorecard 静态)。一代之前静态配额的死因不是静态,而是住得离数据太远、成本模型失真、且是唯一保护层。</div>
 <div class="principle"><b>15. 软件规模大了就是物理系统。</b>惯性、滞后、振荡、共振——处理它们的数学在隔壁自动化系躺了一百年,最聪明的一步是识别同构,不是发明新公式。</div>
 
-<h2 id="reading">7. 延伸阅读</h2>
+<h2 id="reading">8. 延伸阅读</h2>
 <ul>
-<li>Uber Cinnamon 系列博客(PID 实现细节与真实参数):"Cinnamon: Using Century Old Tech to Build a Mean Load Shedder" 及 auto-tuner 续篇</li>
+<li>Uber Cinnamon 系列博客(PID 实现细节与真实参数):<a href="https://www.uber.com/en-US/blog/cinnamon-using-century-old-tech-to-build-a-mean-load-shedder/">"Cinnamon: Using Century Old Tech to Build a Mean Load Shedder"</a> 及 auto-tuner 续篇——rejector / scheduler / PID 输入为队列进出量,均出自此文</li>
 <li>CoDel 原始论文:Nichols &amp; Jacobson, "Controlling Queue Delay", ACM Queue 2012</li>
 <li>Netflix concurrency-limits(GitHub):gradient 算法,TCP 思路搬到服务层</li>
 <li>Amazon Builders' Library:David Yanacek, "Using load shedding to avoid overload"</li>
