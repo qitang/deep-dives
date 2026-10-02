@@ -45,6 +45,11 @@
   <p class="sub">读 tech blog / 拆解 topic 的深读笔记。每篇记录:文章总结、机制拆解、我的疑问与解惑、经验连接、可移植的通用原则。由 <code>/deep-dive</code> 工作流生成。</p>
 
   <!-- NOTES-LIST:START (新笔记加在最上面) -->
+  <a class="note" href="notes/2026-10-02-zookeeper-wait-free-coordination.html">
+    <div class="title">ZooKeeper：wait-free 协调服务 — 写 linearizable、读故意不、锁的安全在资源那边</div>
+    <div class="desc">为什么不做锁服务 · znode/ephemeral/sequential/watch/version 各挡什么 · 写全序 + 单客户端 FIFO + 读本地 · ready znode · 锁配方与 herd effect · Zab 对 Raft · sync() 为什么不广播 · fuzzy snapshot = read skew · 读涨写降 · Raft 三档读 · fencing token = 资源层乐观锁 · pump.fun 的 Redis 锁缺哪条</div>
+    <div class="meta"><span class="tag">6.5840</span><span class="tag">论文拆解</span>2026-10-02 · 来源：Hunt et al., USENIX ATC 2010</div>
+  </a>
   <a class="note" href="notes/2026-09-01-llm-batch-inference.html">
     <div class="title">LLM Batch Inference 与权重搬运开销:从显存物理到投机解码</div>
     <div class="desc">每 token 搬一遍权重 · memory-bound 账 (42ms vs 0.14ms) · KV cache 限 batch · continuous batching · prefill/decode 分离 · speculative decoding · Groq 全 SRAM</div>

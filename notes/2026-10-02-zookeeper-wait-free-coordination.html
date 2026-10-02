@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZooKeeper：wait-free 协调服务 — 6.5840 论文笔记</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>ZooKeeper：wait-free 协调服务 — 写 linearizable、读故意不、锁的安全在资源那边</h1>
+  <div class="meta">
+    <span class="tag">6.5840</span><span class="tag">论文拆解</span>
+    深读日期：2026-09-28 → 2026-10-02（5 个 session）·
+    论文：<a href="https://pdos.csail.mit.edu/6.824/papers/zookeeper.pdf">ZooKeeper: Wait-free coordination for Internet-scale systems</a>
+    (Hunt, Konar, Junqueira, Reed · USENIX ATC 2010) · MIT 6.5840 第 1 篇（Raft 之后）
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">论文总结</a></li>
+    <li><a href="#debate">核心争论：锁的安全到底在哪一层</a></li>
+    <li><a href="#stations">七站机制拆解</a></li>
+    <li><a href="#qa">我的疑问与解惑（本笔记最有价值的部分）</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#recall">复述结果与回忆清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. 论文总结</h2>
+
+<p><b>背景。</b>分布式应用都需要"协调"：配置分发、组成员、选主、锁。2006 年 Google 的 Chubby 给出一个答案：一个用 Paxos 复制的<b>锁服务</b>，客户端调 <code>lock()</code> 拿不到就在服务器里排队。Yahoo! 在 2010 年给出另一个答案，ZooKeeper，立场几乎相反。</p>
+
+<p><b>问题。</b>阻塞式原语（锁）在服务器端有两个病：一个慢客户端（GC 暂停、网络抖）会拖住所有等它的人；服务器要替等待者保存上下文、要判断持锁者死没死，实现复杂。Chubby 的客户端缓存失效也是同一个病：写要等所有缓存了该数据的客户端 ack，一个卡住全体卡住，只能靠 lease 止血。</p>
+
+<p><b>解法。</b>ZooKeeper 不提供锁。它提供一棵内存里的树（znode），一套文件系统风格的 API（create / delete / exists / getData / setData / getChildren / sync），每个操作都是 <b>wait-free</b> 的：答案只取决于服务器当前状态，永远不等另一个客户端。"等"这件事搬到客户端，靠 <b>watch</b>（一次性通知）代替轮询。四个零件各挡一个坏场景：ephemeral 节点随 session 消亡（持锁者崩了自动放锁）、sequential 节点名字带单调编号（排队不用服务器记）、watch（等而不轮询）、version 条件更新（防 lost update）。锁、选主、组成员、屏障全是客户端用这四个零件拼出来的"配方"，服务器一个字都不知道。论文称之为 coordination kernel + coordination recipes。</p>
+
+<p><b>一致性保证只有两条。</b>(1) 所有写 linearizable：写全部转发给 leader，排成一条全局顺序（zxid），用 Zab 原子广播到多数派；(2) 单客户端 FIFO：一个 session 的请求按发出顺序执行，读写都算。<b>读故意不 linearizable</b>：读在客户端连的那台 server 本地内存答，可能落后。要最新就 <code>sync()</code>（让自己的 follower 先追平 leader，不走广播）或者先发一个写。这两条加起来恰好够实现所有配方：写者的 FIFO 保证 ready znode 排在所有配置写之后，前缀性质保证看到 ready 的 server 一定有全部配置；"通知先于新状态"保证读者读到一半配置变了会先被叫醒。</p>
+
+<p><b>实现。</b>写走管线：请求 → leader 算出执行后的新状态打包成幂等事务 → Zab 分 zxid（高 32 位 epoch、低 32 位计数）→ PROPOSAL 到所有 follower、各自 fsync、ACK → 多数派后 COMMIT → 每台按序 apply 到内存树 → 客户端连的那台 apply 完才回复。读：本地内存，零网络。watch 由客户端连的那台本地触发，apply 一个写时顺手发它的通知。快照是 fuzzy 的：不冻树边扫边写，靠事务幂等重放收敛。session 跨 server 搬家时带着最后见过的 zxid，新 server 落后就先不接待，保证不倒退。session 超时由 leader 判定，删 ephemeral 节点。</p>
+
+<p><b>结果。</b>饱和吞吐（Table 1）：100% 读时 3 台 87k ops/s、13 台 460k，近似线性涨，因为每台都能答读；0% 读时 3 台 21k、13 台 8k，随 server 数降，因为 leader 要给每个 follower 发 PROPOSAL/COMMIT。强迫所有客户端只连 leader（Chubby 模式）后连写吞吐都更差，因为 leader 的 CPU 被接客户端分走。选主 &lt; 200ms。Yahoo! 的爬虫调度、消息中间件 YMB、Katta 索引都在生产上用它。</p>
+
+<p><b>论文自己的教训。</b>把复杂度推到客户端换来服务器简单和高吞吐；读不 linearizable 看起来弱，但配合 FIFO 和 watch 的顺序保证，足以拼出强一致的原语；wait-free 对性能和容错都是关键。</p>
+
+<h2 id="debate">2. 核心争论：锁的安全到底在哪一层</h2>
+
+<p>这篇论文正文一个字没提 fencing，但我在第 5 站末尾提前问了"fencing token 到底怎么用 zxid 解决"，之后跑了十几轮，中间两次"越说越糊涂"，最后在"到底什么 API"那一问上通了。推导链整理如下。</p>
+
+<blockquote>
+<p><b>1. 判死一定会判错。</b>ZooKeeper 靠 session 超时 s 判客户端死活。A 拿着锁 GC 暂停 35 秒，s = 30，第 30 秒 leader 判 A 死、删 ephemeral 节点，B 第 31 秒拿到锁。第 35 秒 A 醒来，<b>代码从停的地方继续往下跑</b>，下一行就是写被保护的东西。A 没有任何机会怀疑自己。两个人同时以为有锁。</p>
+<p><b>2. 锁服务拦不住。</b>A 接下来写的是 ZooKeeper <b>外面</b>的东西（一张表、一个文件、一个服务），ZooKeeper 不知道它存在。任何锁服务都封装不了"拿锁 + 写资源"，除非资源就住在锁服务里。</p>
+<p><b>3. 只能资源自己拦。</b>资源要能认出"这是个过期的持锁人"。办法：每一任持锁人有一个<b>单调递增的号</b>，资源记住见过的最大号，小的拒。这就是 fencing token（Chubby 叫 sequencer，Kleppmann 2016 年总结成通用模式）。</p>
+<p><b>4. ZooKeeper 的贡献只是号。</b>A 拿锁那次 <code>create</code> 是个写，有 zxid，比如 (4,60)。这个数在拿锁时冻住，之后每次写资源都带着。B 后拿锁，create 的 zxid 必然更大（全序），(4,75)。换 leader 也不乱，epoch 在高 32 位。<b>不能带"当前 zxid"</b>，否则 A 醒来一问是 (4,90)，fencing 失效。</p>
+<p><b>5. 认号用资源自己的条件写接口。</b>ZooKeeper 没有这个 API。SQL 是 <code>UPDATE … WHERE last_token &lt;= :token</code>，S3 是 <code>If-Match</code>，Redis 是 Lua 脚本里比完再写，HTTP 服务是请求头，只有被保护对象恰好是 znode 时才是 <code>setData(path, data, version)</code>。</p>
+<p><b>6. 所以 fencing = 资源层的乐观锁，version 由锁服务代发。</b>（我自己的总结：这就是个 version number + optimistic lock。）差别只是 version 挂在"锁的任期"上而不是行上，所以检查是 <code>&lt;=</code> 不是 <code>=</code>，一任可以写很多次。</p>
+<p><b>7. 推论。</b>既然正确性来自资源的条件写，锁就只剩"减少冲突、少白干"的作用。锁服务挂了、判错了，最坏是多几次被拒的写，不会错数据。<b>任何分布式锁单独都不是正确性的基石，ZooKeeper 的也不是</b>；它只是附带一个能做基石的号。Redis 的 <code>SET NX PX</code> 不附带，补一个 <code>INCR</code> 也只能单机内单调，主从异步复制一切换就可能倒退。</p>
+</blockquote>
+
+<p>这条链通了之后，pump.fun 的 Redis 锁的问题就有了答案：它保护的写本来就带条件或幂等，所以 Redis 做 best effort 是正确用法，换 ZooKeeper 不会更正确。</p>
+
+<h2 id="stations">3. 七站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站 · 为什么不做一个锁服务</h3>
+<p>坏场景：Chubby 式 <code>lock()</code>，A 持锁后 GC 暂停 30 秒，B、C 的请求挂在服务器里，服务器要替它们保存上下文、要判 A 死活、判早了 A 醒来还以为有锁。一个慢客户端拖住所有等锁的人。缓存失效同病：写要等所有缓存者 ack。</p>
+<p>ZooKeeper 的回答：服务器端每个操作的答案只取决于当前状态，永远不等另一个客户端（wait-free）。没有 <code>lock()</code>，只有立刻返回的 create / delete / getData；等待搬到客户端，靠 watch 让服务器在变化时发一条通知。类比：Redis <code>SETNX</code> + 服务器主动推"它变了"。代价：服务器只能给弱一点的保证，配方要客户端自己拼。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站 · API 的四个零件，各挡一个坏场景</h3>
+<table>
+<tr><th>零件</th><th>挡的坏场景</th><th>怎么挡</th></tr>
+<tr><td>Ephemeral</td><td>A 拿锁后断电，没人 delete，死人永远持锁</td><td>节点寿命绑 session，leader 判 session 死就自动删</td></tr>
+<tr><td>Sequential</td><td>100 个 worker 没唯一 id，create 同名冲突；排队要服务器记</td><td>名字追加父节点下单调递增的编号，队伍就是一排节点名</td></tr>
+<tr><td>Watch</td><td>轮询浪费、发现晚</td><td>读时登记，变化时一次性通知；只说"变了"不说变成什么</td></tr>
+<tr><td>Version</td><td>A、B 同时读 v3 各自写，后到的盖掉先到的（lost update）</td><td><code>setData(path, data, version)</code>，version 不等就拒；= Postgres 乐观锁</td></tr>
+</table>
+</div>
+
+<div class="station">
+<h3>第 3 站（心脏站）· 两条保证，一条故意不保证</h3>
+<p>画法：每台 server 一行，每格一个已 apply 的写，格上标 zxid，行尾标连着的客户端。</p>
+<pre><code>                zxid 1            zxid 2            zxid 3
+S1 (L)   [ /cfg ← "a" ]  [ /cfg ← "b" ]  [ create /ready ]
+S2       [ /cfg ← "a" ]  [ /cfg ← "b" ]                        ← B
+S3       [ /cfg ← "a" ]                                        ← C</code></pre>
+<p><b>写 linearizable</b>：所有写经 leader 排成一条全局线，每台按序 apply，三行永远是同一序列的前缀，只差走到哪。<b>单客户端 FIFO</b>：一个 session 的请求按发出顺序执行。<b>读不 linearizable</b>：读本地，C 此刻读 /cfg 是 a。</p>
+<p>三个递进画面把 FIFO 和"读可能旧"的矛盾拆开：① 一台机器一个客户端，先写后读当然读到；② S2 是 follower 要去 leader 拿号，读排在队列里等写 apply 完；③ 加 S3 和 C，C 读不到 B 的写因为 S3 还没收到。结论：<b>自己的写一定读得到，别人的写看你连的那台走到哪。</b></p>
+<p><b>ready znode</b>：新 leader 先 delete ready、改 5000 个配置、最后 create ready，全部异步连发。读者看到 ready 存在 ⇒ 那台 server 到了 create ready 的 zxid ⇒ 前缀性质保证 5000 个配置全在。读者读到一半配置变了怎么办：读 ready 时带 watch，"通知先于新状态"（server 单线程，apply 一个写时顺手发它的通知再处理后面的读）保证读者先收到通知再看到新数据。</p>
+<p><b>闭合两周前的旧问题</b>：A 拿锁写配置放锁，B 拿锁读配置，B 的 follower 落后会读旧配置吗？不会。B 的 create(/lock) 只在节点不存在时成功，所以排在 A 的 delete 之后（zxid 23 &gt; 22）；A 的 setData 在 delete 之前（A 的 FIFO）；B 的 follower 要 apply 到 23 才回复 B，前缀保证 21 在；B 的读在 create 之后（B 的 FIFO）。<b>拿锁是个写，写把你的 server 钉在那个 zxid。</b></p>
+</div>
+
+<div class="station">
+<h3>第 4 站 · 锁配方与 herd effect</h3>
+<pre><code>Lock
+1  n = create(l + "/lock-", EPHEMERAL|SEQUENTIAL)
+2  C = getChildren(l, false)
+3  if n 是 C 里最小的：拿到锁
+4  p = C 里排在 n 前面那一个
+5  if exists(p, watch=true)：等通知
+6  goto 2
+Unlock
+1  delete(n)</code></pre>
+<p>坏场景：1000 人都 watch 同一个 /lock，释放一次 → 1000 条通知 + 1000 个 create（写，走 Zab）+ 999 次重新 watch，约 3000 条消息。配方：只 watch 前一个，释放一次只醒一个人，约 3 条消息。第 6 行 goto 2 而不是直接拿锁，因为醒来可能是前面的人崩了而不是释放了。getChildren 传 false 不 watch 目录，否则又是 herd。</p>
+<p>配方里的读读到 stale 为什么不出错：自己的 create 把 server 钉在 zxid ≥ 40，前面的人全看得见（不会错拿锁）；40 之后的释放晚看到只会多等：exists 返回 false 就重查，返回 true 就登记 watch，删除写到本地时必触发。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站 · 实现</h3>
+<p><b>管线与 zxid</b>：leader 把请求算成幂等事务（"设成 b、version 4"，不是"if version==3"），Zab 分号广播。zxid 64 位 = epoch(32) : counter(32)，换 leader 必换 epoch，(3,500) 之后是 (4,1)，理由同 Raft term。</p>
+<p><b>Zab 对 Raft</b>（来源 Zab 论文，非本文）：PROPOSAL ≈ AppendEntries（follower 写盘 ACK，<b>不 apply</b>），COMMIT ≈ 推进 commitIndex（follower 这才 apply）。未 COMMIT 可能被截，已 COMMIT 永不。客户端的世界只有内存树，内存树只在 COMMIT 后动，PROPOSAL 对客户端隐形，watch 也只在 apply 时触发。Zab 选 zxid 最大者当 leader。</p>
+<pre><code>1. B → S2:      写
+2. S2 → leader: 转发
+3. leader:      分 zxid，PROPOSAL 广播
+4. followers:   写盘，ACK
+5. leader:      多数派 ACK → COMMIT 广播
+6. S2:          apply 到内存树
+7. S2 → B:      回复"写成功"
+8. S2:          处理 B 队列里排在后面的读</code></pre>
+<p><b>sync()</b>：不分号、不广播、不写盘、不等多数派，只是 leader 往"leader→S3 队列"末尾塞一个标记。S3 取到标记时前面所有 COMMIT 必已 apply（火车最后挂一节空车厢）。代价一次 leader 往返。缝：靠"这个 leader 还是 leader"的超时假设，队列空时严格该发 null 事务确认，实现省掉了（MIT notes 点了这一点）。</p>
+<p><b>Fuzzy snapshot</b>：三样东西分开——内存树（apply 的目标，崩了没）、磁盘日志（每写先落盘）、磁盘快照（定期把内存树拷到磁盘，= Redis bgsave，让重放不从第一条开始）。不冻树边扫边 apply，快照可能是从没存在过的状态（read skew，DDIA 备份例子），但从扫描起点 zxid 重放全部幂等事务后必收敛：节点没被改过则快照值对，被改过则重放会盖掉。恢复中的那台不接客户端，其他照常；新写在别的机器提交，之后从 leader 按序补，新老不分都是下一条。</p>
+<p><b>换 server 不倒退</b>：每个回复（含 heartbeat）带 server 的最新 zxid，客户端记住；重连时交给新 server，新 server 落后就先不接待。= Lamport 时钟的退化版（只有 leader 能 tick，全序标量不用 max）= Bayou 的 monotonic reads。</p>
+<p><b>Session 超时</b> s：客户端闲 s/3 发 heartbeat，2s/3 没回应换 server，leader 在 s 内没从任何 server 听到就判死删 ephemeral。判晚了只是慢，判早了两人同时持锁 → fencing。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站 · 性能</h3>
+<table>
+<tr><th>server 数</th><th>100% 读</th><th>0% 读</th></tr>
+<tr><td>3</td><td>87k</td><td>21k</td></tr>
+<tr><td>5</td><td>165k</td><td>18k</td></tr>
+<tr><td>7</td><td>257k</td><td>14k</td></tr>
+<tr><td>9</td><td>296k</td><td>12k</td></tr>
+<tr><td>13</td><td>460k</td><td>8k</td></tr>
+</table>
+<p>读涨：本地内存答，每加一台多一台扛读。写降：leader 要给每个 follower 发 PROPOSAL/COMMIT，3 台发 2 份、13 台发 12 份，leader 的 CPU 和网卡是瓶颈；多数派大小（2→7）影响小，因为等 ACK 并行。每台 fsync 后才 ACK，论文承认"原理上过严"但 ZooKeeper 是 ground truth。Figure 6：全连 leader 后连写吞吐都更差。Figure 8：选主 &lt; 200ms；follower 恢复后吞吐不回满，因为客户端只在连接断时换 server。要写吞吐就分片成多个集群。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站 · 对照</h3>
+<table>
+<tr><th>档</th><th>做法</th><th>旧值</th><th>代价</th><th>谁扛读</th></tr>
+<tr><td>① leader 读</td><td>先跟多数派 heartbeat 确认还是 leader</td><td>不会</td><td>一轮 RTT</td><td>leader</td></tr>
+<tr><td>② follower + ReadIndex</td><td>问 leader commitIndex，等自己 apply 到那再读</td><td>不会</td><td>一轮到 leader</td><td>所有</td></tr>
+<tr><td>③ follower 本地读</td><td>直接读</td><td>会</td><td>零</td><td>所有</td></tr>
+</table>
+<p>ZooKeeper 默认 ③，sync()+读 ≈ ②；etcd 默认 linearizable（①/②），<code>serializable=true</code> 才降到 ③。两个系统对同一个刻度盘拧了相反的默认值。读的档位只决定白干的概率，正确性在写的条件里。</p>
+<table>
+<tr><th>锁要的性质</th><th>ZooKeeper</th><th>Redis SET NX PX</th></tr>
+<tr><td>互斥</td><td>create 只成功一次</td><td>SET NX 只成功一次</td></tr>
+<tr><td>持有者崩了自动放</td><td>ephemeral + session 超时</td><td>PX 过期</td></tr>
+<tr><td>等锁不轮询</td><td>watch</td><td>无，sleep 重试</td></tr>
+<tr><td>过期持有者被挡（fencing）</td><td>zxid 当 token，资源认号</td><td><b>没有号</b>；加 INCR 也只单机单调</td></tr>
+<tr><td>锁服务自己挂了</td><td>多数派活着就不丢锁</td><td>主从异步切换可能两人同时持锁</td></tr>
+</table>
+<p>两种疼法：持有者暂停超过 TTL（无 fencing → lost update，谁都不报错）；主从切换锁凭空消失（Redlock 争论的起点）。可以不在乎的条件：被保护的写幂等、或只浪费算力、或本来就带条件。</p>
+</div>
+
+<h2 id="qa">4. 我的疑问与解惑</h2>
+
+<h3>第 1–2 站</h3>
+<div class="qa"><p class="q">我只听过 ZooKeeper 的 sequential node，和你讲的 SETNX 式锁不一样？</p><p class="a">同一条路。SETNX 式是论文 2.4 最简单那版锁（抢同一个节点），sequential 是治 herd effect 的改进版。队伍从"服务器挂起的请求"变成"一排 znode 的名字"，服务器对每个 create 还是立刻返回。</p></div>
+<div class="qa"><p class="q">为什么 create 失败了就 watch？</p><p class="a">create 失败 = 有人占着；watch = 让服务器在节点变化时叫醒我再来抢。等在客户端这边，服务器只留一条轻登记，A 卡 30 秒服务器也不用替 B 保存上下文。</p></div>
+
+<h3>第 3 站（这里问得最多）</h3>
+<div class="qa"><p class="q">zxid 是 process id 吗？就是不同的 client？</p><p class="a">不是。zxid 是每个写在全局顺序里排第几，leader 收到写后按收到顺序分的号，跟谁发的无关。= Kafka 一个 partition 的 offset，= Raft 的 log index。</p></div>
+<div class="qa"><p class="q">"你连的那台机器按你发的顺序处理你的请求"——这不就是 sequential consistency 里每个线程自己顺序保留那个条件吗？</p><p class="a">对，自己推出来的。SC 两个条件：每线程 program order 保留 + 所有操作能排成一条大家同意的总序。ZooKeeper 的 FIFO 是条件 1；条件 2 只对写做到（zxid 线），读不进那条线。</p></div>
+<div class="qa"><p class="q">第 2 个请求在 S2 等 leader 的时候就到了，这不是 concurrent request 吗？能保证顺序？</p><p class="a">在飞时 concurrent（pipeline，为了快），执行时有序。靠两件事：一条 TCP 保序；server 给每个 session 一条队列，队头的写没 apply 完不碰队尾的读。= Kafka producer 开 max.in.flight=5 + idempotence，broker 落盘顺序仍是发送顺序。</p></div>
+<div class="qa"><p class="q">那 client 不用同一条 TCP 呢？</p><p class="a">ZooKeeper 不给这个选择：一个 session 同时恰好一条 TCP 连一台 server，客户端库管着，碰不到 socket。连接断了库换 server，session 跟着搬（带 zxid 检查）。开两个 session 就是两个客户端，互不保序。</p></div>
+<div class="qa"><p class="q">写发出去之后 session 断了、S2 崩了呢？</p><p class="a">session 不死（超时前重连）。那个写的结果 B 不知道，报 CONNECTIONLOSS，B 自己查或带 version 重试，= Raft §8 客户端重发问题，ZooKeeper 没替你去重。新 server 不能比 B 见过的 zxid 旧。但 B 没收到回复就没记那个 zxid，所以 FIFO 保证的是"被告知成功的写"，不是"发出去的写"。</p></div>
+<div class="qa"><p class="q">感觉这个协议好 brittle 很脆弱。</p><p class="a">论文有意为之：coordination kernel + recipes，复杂度推给客户端。脆在配方要自己想对（忘了 watch 就有半套配置的洞）；不脆在两条保证本身是硬的，配方只依赖这两条就对。Kafka 也是这路数（exactly-once 是应用级协议拼出来的），不觉得脆是因为有人替你拼好了；ZooKeeper 实践中用 Curator 现成 recipe（论文外）。</p></div>
+<div class="qa"><p class="q">这种"先 broadcast 再处理下一个 request"感觉很奇怪，不像是单纯的 distributed system。</p><p class="a">直觉对：那不是分布式协议，是一台 server 内部的本地单线程逻辑。分布式的只有写顺序（Zab）。通知是 S2 发给连在 S2 上登记过 watch 的客户端，不是跨机器广播。每台 server = 一台回放复制流的单线程 Redis，apply 一条命令时 keyspace notification 就在那一刻发。这也是它快的原因：只有写顺序走网络。</p></div>
+<div class="qa"><p class="q">这样对客户端依赖很大啊，如果弄成多 TCP connection 或者多线程？</p><p class="a">依赖的是客户端库，它是系统的一半（论文第 2 节：client library 管连接）。应用 10 个线程调同一个 client 对象，库串成一条队列；FIFO 的顺序就是进库的顺序，和两个线程打一个 Redis 连接一样。绕不过库开多条 TCP；多 client 对象 = 多 session，互不保序。</p></div>
+<div class="qa"><p class="q">client 必须所有 request stick 到同一个 server，很不优雅。</p><p class="a">论文 5.1 自己承认代价：客户端只在连接断时换 server，Figure 8 里 follower 恢复后负载迟迟不均衡。换来 FIFO、watch、session 三样全是单机本地逻辑。"每个请求带 zxid、server 落后先追"的做法 ZooKeeper 有，只在换 server 那一刻用，不想每个请求都付。Kafka consumer 也 sticky 到 partition leader，Redis Cluster 按 slot 粘节点；ZooKeeper 粘的理由是一致性不是分片。</p></div>
+<div class="qa"><p class="q">你的例子里为啥 client 要读 5000 个 nodes？啥意思？</p><p class="a">论文 2.3 的数字，为了说明异步 pipeline（一个个等回复 10 秒，连发不到 1 秒）。配置拆成很多节点的真实场景：YMB 每个 topic 一个 znode 记 primary/backup，Katta 每个 shard 一个。拆开是为了各进程独立 watch 自己关心的、1MB 上限、独立 version。"新 leader 改 5000 个"= 一台 broker 挂了 controller 重新分配几千个 topic。</p></div>
+<div class="qa"><p class="q">【旧问题，2026-09-14 留下】A 拿锁、写配置、放锁；B 拿锁、读配置。B 连的 follower 落后，B 会读到旧配置吗？</p><p class="a">不会。见第 3 站卡片末尾。不拿锁直接读才会旧，那时要发一个写或 sync()。</p></div>
+
+<h3>第 4 站</h3>
+<div class="qa"><p class="q">getChildren 要拿 1000 个 children 才能找 min？</p><p class="a">对，配方的真实成本，论文没讨论：第 k 个排队者拿 k 个名字，总共 O(n²)。论文不在乎因为它是本地读（不走 leader、不走 Zab），且假设竞争者几十个。几千人排队确实是瓶颈，Curator 也没绕开，根治要改 API。</p></div>
+<div class="qa"><p class="q">读的时候读到 stale 数据咋办？</p><p class="a">配方设计成读到旧的也不出错。见第 4 站卡片。</p></div>
+<div class="qa"><p class="q">感觉 ZooKeeper 实现的是一个 causal consistency。</p><p class="a">很接近。像：FIFO + 经 ZooKeeper 传播的因果 + monotonic reads。比 causal 强：写是全序。比 causal 弱（关键）：因果只在经过 ZooKeeper 的路径上被追踪，A 用 HTTP 告诉 B "改好了"这条链 ZooKeeper 看不见（论文 2.3 第二例），要 sync()。MIT notes 的说法："每个客户端看到一个一致的、只往前走的前缀"。</p></div>
+
+<h3>第 5 站</h3>
+<div class="qa"><p class="q">epoch 3 的 leader 发到 (3,500) 崩了，新 leader 第一个写是 (3,501) 还是 300？</p><p class="a">(4,1)。换 leader 必换 epoch，理由同 Raft term：被隔离的旧 leader 可能还发 (3,501)，不换号就会两个不同的写用同一个号。</p></div>
+<div class="qa"><p class="q">所以这就是个 Raft 的变体吗？broadcast 到了 follower 就可以被 client 读到吗？broadcast 的 value 会被 revert 吗？broadcast 就是 commit 吗？</p><p class="a">近亲（Zab 2008，Raft 2014）。PROPOSAL ≈ AppendEntries，follower 写盘 ACK 不 apply，读不到；COMMIT ≈ 推进 commitIndex，follower 这才 apply。未 COMMIT 的可能被截（= Raft index 10 的命运），已 COMMIT 的永不（新 leader 从多数派里选 zxid 最大者）。广播 ≠ commit，是两条消息。来源 Zab 论文 [24]，非本文。</p></div>
+<div class="qa"><p class="q">那如果和 Raft 类似，read from follower 还要等 write 回到 follower 并且 commit 才能读吗？</p><p class="a">普通读什么都不等，读此刻内存树（= 已 COMMIT 并 apply 到这台的效果）。唯一的等是自己 session 的 FIFO。Raft leader 读花一轮 RTT 换不旧，ZooKeeper 花零网络接受可能旧。</p></div>
+<div class="qa"><p class="q">那 ZooKeeper 是怎么保证 read and write consistency 的？</p><p class="a">自己的读写：保证（写在本 server apply 后才回复 + session 队列）。别人的写：不保证，要 sync() 或先发一个写。它保的不是笼统的"读写一致"，是精确的三条：写全序、自己 FIFO、要最新自己 sync。</p></div>
+<div class="qa"><p class="q">"写完再读"是怎么保证的？是在 client 端 check previous write is fully committed？</p><p class="a">不在客户端，在 server 端：每个 session 一条队列，队头的写没 apply 完不碰队尾的读（论文 4.4 "process requests from clients in FIFO order"）。客户端库只记最后见过的 zxid，那是换 server 防倒退用的。应用代码两个异步调用前后脚发出去，不用等回调。</p></div>
+<div class="qa"><p class="q">S2 apply 回复 B 之后，严格说会 broadcast 然后再 serve read request 对吗？</p><p class="a">顺序反了。广播在 apply 之前，由 leader 发：转发 → PROPOSAL → ACK → COMMIT → S2 apply → 回复 B → 处理 B 的读。第 7 步之后没有任何广播。</p></div>
+<div class="qa"><p class="q">leader 都没确认 broadcast 能到大多数就敢广播？</p><p class="a">就是敢，因为 PROPOSAL 是提问不是决定。follower 只写盘不 apply，对外不可见。leader 靠发出去数 ACK 来发现能不能到多数派，数够发 COMMIT，不够就不发、那条作废。= Raft leader 追加日志后立刻发 AppendEntries。"先确认再广播"本身就得一次广播，绕回来了。</p></div>
+<div class="qa"><p class="q">我完全不懂了，所以 watch 到底是 watch committed write 还是 uncommitted write？</p><p class="a">只在 committed 的写 apply 到本地内存树时触发。客户端的整个世界只有内存树，内存树只在 COMMIT 后动；PROPOSAL 躺在磁盘日志里，读不到、watch 不响。后来发现是术语错位：我说的"broadcast"= COMMIT，没把 PROPOSAL 算进去，模型本身没错。</p></div>
+<div class="qa"><p class="q">一个 follower 上的 write 会 force 它和 leader in sync？</p><p class="a">对，追到那个写的 zxid 为止，不是追到 leader 手里的一切。sync() 做同一件事但不真写。</p></div>
+<div class="qa"><p class="q">那它是怎么 ensure 自己和 leader in sync 呢？</p><p class="a">不用检查，被动等到：leader→follower 一条 TCP 按 zxid 顺序流 COMMIT，follower 顺序 apply，COMMIT (4,60) 到手时前面 29 条必已 apply。= Kafka follower fetch 到 offset 60 则 31–59 早拿到。崩久了重加入走 Zab 恢复 DIFF/SNAP（论文外）。</p></div>
+<div class="qa"><p class="q">fuzzy snapshot 这不是一个经典的 transaction 的 repeated read 问题吗？</p><p class="a">就是它，精确名字 read skew（DDIA ch7），DDIA 举的例子恰好是备份。数据库用快照隔离（MVCC）解；ZooKeeper 不解，靠幂等重放收敛，因为快照不给人读、只做恢复起点。第 2 篇论文（隔离级别）回来。</p></div>
+<div class="qa"><p class="q">还是不懂，为啥不解可以？</p><p class="a">快照只是恢复起点。每个节点两种情况：扫描期间没改（快照值对，重放没它）；改了（快照值不知道是改前改后，但重放从扫描起点起每一次"设成 X"都会再来，最后一条落下去就是 X，跟快照记什么无关）。唯一条件：事务是"设成 X"（幂等）不是"+1"。白板比喻：照片拍到哪一瞬间无所谓，拍照后的每一笔清单盖上去就对。</p></div>
+<div class="qa"><p class="q">所以第二次重跑之前 ZooKeeper 不会 serve request？</p><p class="a">那一台不接客户端，直到本地重放完 + 从 leader 补齐错过的写。其他 server 照常，客户端早被库切走了。fuzzy 是把代价从"正常运行每隔一阵停几秒（全体感觉到）"挪到"崩溃恢复多重放一段（只那台承担）"。</p></div>
+<div class="qa"><p class="q">第二次跑又有新的 write 怎么办？</p><p class="a">本地重放的是崩溃前写下的固定日志，不会长；这台此时不是 follower，leader 不给它发东西。重放完连 leader 补 81–120，补的时候来了 121 就接在流的尾巴上。新写永远在末尾，不会插进中间，新老不分都是"下一条"。</p></div>
+<div class="qa"><p class="q">你说话完全不 make sense，正常运行为啥扫描树？ZooKeeper 不是实时 apply 到 state machine 吗？</p><p class="a">根因是没分清三样东西。apply 的目标是内存树，实时，但断电就没；磁盘日志每写先落盘，崩了靠它重建，但从头重放一年太慢；快照 = 定期把内存树拷到磁盘（Redis bgsave），让重放只从最近一次快照开始。"扫树"= 拷内存树到磁盘这个动作，不是 apply，是备份 apply 的结果。只能活着的时候拍，崩了内存没了拍不了。= Raft §7 快照的目的，差别只在 ZooKeeper 不冻结。</p></div>
+<div class="qa"><p class="q">换 server 带 zxid 这不是 Lamport timestamp 吗？</p><p class="a">像：逻辑时间戳随消息传。不同：Lamport 里每个进程都能 tick（取 max 再 +1，偏序）；ZooKeeper 只有 leader 能发号，zxid 天然全序，别人只携带不产生，比大小就完了。= Lamport 时钟的退化版。专名 session guarantees（Bayou 1994，课程外），monotonic reads 是其中一条。</p></div>
+
+<h3>第 7 站提前问（fencing，跑了十几轮）</h3>
+<div class="qa"><p class="q">上面那个 fencing token 到底怎么用 zxid solve 的？</p><p class="a">拿锁那次 create 的 zxid 就是 token（实现上 Stat.czxid），冻住不变。资源记最大号拒更小的。后拿锁的号必更大（全序 + epoch 高位，(5,3) &gt; (4,60) 直接比 64 位整数）。这篇论文没讲，来自 Chubby 的 sequencer 和 Kleppmann。</p></div>
+<div class="qa"><p class="q">没懂，怎么用 ephemeral node 做 lock？</p><p class="a">（第 4 站内容忘了）约定路径 /lock，谁 create 成功谁持锁（create 对同一路径只能成功一次）；EPHEMERAL 绑 session，判死自动删，锁不会被死人永远拿着；等的人 exists(/lock, watch) 被删时通知再 create。</p></div>
+<div class="qa"><p class="q">所以如果 A 活过了，想 write something 就比较带上 current zxid？</p><p class="a">不是 current，是拿锁那一刻的 zxid，之后不变。带 current 的话 A 醒来一问是 (4,90) &gt; 75，fencing 失效。token 的意义是"我是第几任"，必须在拿锁时冻住。</p></div>
+<div class="qa"><p class="q">所以这是纯依靠 client 实现？</p><p class="a">client + 资源两方，ZooKeeper 只出一个号，不知道资源存在。硬限制：资源必须能检查 token，第三方 API 没地方放 token 就做不了，只能调长判死时间 + 祈祷。</p></div>
+<div class="qa"><p class="q">A 以为自己已经有锁了，那他还写 R 干嘛？</p><p class="a">写 R 就是拿锁的目的。流程是拿锁 → 改 R → 放锁，GC 暂停在第 1 步和第 2 步之间，A 恢复后代码从停的地方继续，下一行就是改 R。A 根本没机会怀疑。</p></div>
+<div class="qa"><p class="q">除非 ZooKeeper 把 1 和 2 封装在一起，要不然 2 就是一个 regular write，但你说 regular write 不用带 zxid。</p><p class="a">抓得对，我那张表的"regular write"误导了：持锁期间写被保护的 R 必须带 token，"regular"指不归这把锁管的东西。ZooKeeper 封装不了 1+2 因为 R 在它外面，任何锁服务都封装不了。这就是 Kleppmann 的全部论点：资源必须参与。</p></div>
+<div class="qa"><p class="q">那如果 client 不加 AND last_token &lt; 60 condition 呢？</p><p class="a">lost update：B 的 UPDATE amount=100，A 醒来 UPDATE amount=80，余额 80，B 的结果被 A 的过期计算盖掉，Postgres、ZooKeeper、A、B 都不报错。没有 fencing 的分布式锁的全部风险：互斥只在锁服务判断正确时成立。</p></div>
+<div class="qa"><p class="q">所以这和 ZooKeeper 没关系哈哈，这不是协议的一部分。</p><p class="a">对。ZooKeeper 的全部贡献是"每次拿锁有一个免费的全局递增号"。Redis 的 SETNX 没有这个号。其余全在应用。syllabus 放在"对应你手上的模式"而不在论文里。</p></div>
+<div class="qa"><p class="q">哈哈这就是个 version number 和一个 optimistic lock。</p><p class="a">就是，比 Kleppmann 说得还直接：fencing token = 资源层的乐观锁，version 由锁服务代发。细微差别：version 挂在"锁的任期"上不挂在行上，所以检查是 last_token ≤ 60 不是 version = 3，一任可以写很多次；而且行 version 只能发现"这行被别人改过"，发现不了"你已经不是持锁人"（B 没碰的行 A 照写）。推论：锁只剩减少白干的作用，正确性来自 R 的检查。</p></div>
+<div class="qa"><p class="q">这他妈也值得写在论文里？太水了。</p><p class="a">不在 ZooKeeper 论文里，来自 Chubby 一段话和 Kleppmann 2016 博客。"水"是因为我已经会乐观锁。值得写是因为 2016 年 Redlock 争论里很多生产系统的锁都是不带 token 写的。ZooKeeper 论文自己的贡献是 wait-free API、精确的两条保证、读走 follower 的吞吐。</p></div>
+<div class="qa"><p class="q">你 lock 能 lock 100 行？</p><p class="a">能。分布式锁锁的是应用层的任务或资源（"结算 coin X 的收益"），粒度自己定，不是行锁。那个任务可能改 100 行，都带同一个 token。对比 Postgres 的 SELECT FOR UPDATE 锁一行、跨不了进程。</p></div>
+<div class="qa"><p class="q">ZooKeeper 会 track 每个 row 的 last updated token？</p><p class="a">不是 ZooKeeper，是 R（Postgres）自己表里的一列。ZooKeeper 全程只出现一次：拿锁时发号。我反复往 ZooKeeper 身上挂东西，是因为直觉上"锁服务应该负责锁的安全"，论文立场恰好相反。</p></div>
+<div class="qa"><p class="q">你越说我越糊涂了，怎么和 Postgres 扯上关系了？</p><p class="a">我的错，Postgres 只是举例的"被保护的东西"，后来一直用它把人带偏。压回三句：锁保护某个 ZooKeeper 外的东西；判死可能判错所以可能两人同时持锁；要挡住得那个东西自己认号，ZooKeeper 只贡献号。超过 3 轮按规矩止损，记进未闭合。</p></div>
+<div class="qa"><p class="q">所以这个操作到底叫啥？conditional update 吗？</p><p class="a">模式叫 fencing（Chubby 叫 sequencer），操作本身就是 conditional update，条件从"version 相等"换成"token 不小于"。</p></div>
+<div class="qa"><p class="q">所以就是用的 setData(path, data, version) 这个操作吗？那到底什么 API？</p><p class="a">ZooKeeper 没有这个 API。用的是被保护系统自己的条件写接口：SQL <code>UPDATE … WHERE last_token &lt;= :token</code>；S3 PutObject + If-Match；Redis Lua 脚本比 token 再写；HTTP 服务 If-Match 头；只有被保护对象恰好是 znode 时才是 setData(…, version)。——这张表让整件事通了（"卧槽我算是听明白了"）。</p></div>
+<div class="qa"><p class="q">Redis lock 一直知道是 best effort，但是不能做 correctness 的基石。</p><p class="a">对，再推一步：任何分布式锁单独都不能当基石，ZooKeeper 的也不能，session 判死照样判错。区别只是 ZooKeeper 的锁附带一个能用来做正确性的号。基石永远在资源的条件写上。</p></div>
+
+<h3>sync() 复习（第 6 站后）</h3>
+<div class="qa"><p class="q">我忘了 sync 是干啥的。sync 和一般的 write 差不多啊，可能就是 contain 一个 dummy value？</p><p class="a">效果差不多（follower 追平），成本差很多：垃圾写让整个集群干一遍活（分号、PROPOSAL 到所有 follower、每台 fsync、多数派 ACK、COMMIT）；sync 不分号不广播不写盘，只在 leader→S3 那条流里塞一个标记，别的机器不知道。真实差别：写是 Zab 硬保证，sync 靠"这个 leader 还是 leader"的超时假设。</p></div>
+<div class="qa"><p class="q">"leader 把 sync 塞进队列末尾"这句话啥意思？</p><p class="a">leader→S3 一条 TCP：<code>COMMIT 46 | 47 | 48 | 49 | 50 | SYNC(B)</code>。S3 按序取，取到 SYNC 时 46–50 必已 apply，于是回复 B。火车最后挂一节空车厢，空车厢进站时前面都进站了。</p></div>
+<div class="qa"><p class="q">但是 sync 没有 zxid 不会丢失或者乱序？</p><p class="a">不乱序：TCP 保序，它只需和这一条连接上的消息排序，zxid 是给所有机器统一排序用的，SYNC 不去别的机器。可能丢（连接断），但无状态，重发无副作用。zxid 是给"要持久、要全局有序"的东西用的，sync 两个都不要。</p></div>
+
+<h3>第 7 站</h3>
+<div class="qa"><p class="q">"读取当前 leader worker 是谁"这个我不懂，ZooKeeper 里面怎么知道谁是 leader？</p><p class="a">这里的 leader 是应用自己的（50 个 worker 选一个跑定时任务），不是 ZooKeeper 的。配方 = 锁换名字：/election 下 create ephemeral+sequential，最小者当选，把地址写进 /leader；别人 getData(/leader, watch)。论文 2.1："让当前 leader 把信息写在已知位置"。</p></div>
+<div class="qa"><p class="q">Redis 那个就是加个 random id？</p><p class="a">random id 是 Antirez 配方里放锁防误删用的（if GET == my_id then DEL），做不了 fencing，随机数没法比新旧。要 fencing 得 Lua 里 SET NX 成功顺手 INCR 领递增号。缺的性质：跨 failover 单调——主从异步复制，主上 gen 到 61 没同步就崩，从升主后 gen 58，下一任拿到 59 &lt; 61，59 还发了两次。zxid 靠多数派落盘 + epoch 高位不倒退。</p></div>
+<div class="qa"><p class="q">为啥不能保留 58？</p><p class="a">INCR 每次 +1，58 已经发给过某一任。问题不在 59 本身，在主上 59、60、61 已发过没同步，59 重复且小于 61。</p></div>
+<div class="qa"><p class="q">还是不懂，你这个 Redis 和 ZooKeeper 什么关系？</p><p class="a">第 7 站的目的就是把 ZooKeeper 和 pump.fun 手上用的 Redis 锁并排放。INCR 那段是支线讲太细了，收掉，主线只有那张五行对照表。</p></div>
+
+<h3>顺带回到 Raft 的几个问题</h3>
+<div class="qa"><p class="q">Raft serve 一个 write 是 append 到多数 follower 就 return success，还是等到真的 committed？</p><p class="a">等 commit 并 apply 到 leader 的 state machine 后才回（§5.3，回复要带执行结果）。"append 到多数派 + 当前 term"的那一刻就是 committed，没有额外等待。只有旧 term 的日志在多数派上也不算（Figure 8）。</p></div>
+<div class="qa"><p class="q">我记得 append 的 log 可能被 revert，所以多数 append 不等于 commit。</p><p class="a">分三行：少数几台上的会被 revert；多数派上但旧 term 的会被 revert（Figure 8）；多数派上且当前 term 的不会，这就是 committed。</p></div>
+<div class="qa"><p class="q">我记得 AppendEntries 可能多个 step，第一次未必让 leader 和 follower 完全 in sync。</p><p class="a">那是 nextIndex 退格（assumedFollowerLastIndex 退一格重发）。commit 只看 confirmedFollowerLastIndex（matchIndex）够不够多数派。多步是那台落后 follower"追上"的过程，不影响 commit 的定义；三台里两台一次 success 就 commit，第三台慢慢追。</p></div>
+<div class="qa"><p class="q">所以只有 leader 和 follower 完全 in sync 这个 follower 才算 append 成功？</p><p class="a">到那个 index 为止一致，不要求追上 leader 的一切。success 条件：prevLogIndex 处 term 对上 + 本批 entries 追加完；confirmed = prevLogIndex + 本批长度；它对提交 ≤ confirmed 的 index 有贡献。</p></div>
+<div class="qa"><p class="q">【要求记着】Raft 的 corner case：如果不等 log 的 term 和 current term 一样、只看 append 到大多数就提交，可能被 higher term 的 log override。</p><p class="a">Figure 8。规则：leader 只直接提交 term = currentTerm 的日志，旧 term 的等当前 term 一条提交后连带提交（commitIndex 一次跳过去）；新 leader 上任先提交一条 no-op。精度：不是"等新 term 的 AppendEntries 成功"（一台 success），是"多数派 success + 当前 term"，多数派含 leader 自己一票。已进 progress.md 反复回忆清单。</p></div>
+
+<h2 id="experience">5. 与我自己经验的连接</h2>
+<ul>
+  <li><b>Kafka offset = zxid。</b>producer 是谁不重要，进 partition 的先后决定 offset；follower fetch 到 60 则 31–59 早拿到。ZooKeeper 的 leader→follower COMMIT 流就是这个画面。</li>
+  <li><b>Kafka producer max.in.flight + idempotence = 单客户端 FIFO。</b>5 个 batch 同时在路上，broker 落盘顺序仍是发送顺序。在飞时 concurrent、执行时有序，两回事。</li>
+  <li><b>一台回放复制流的单线程 Redis = 一台 ZooKeeper server。</b>apply 一条命令时 keyspace notification 就在那一刻发，天然"通知先于新状态"。Redis bgsave = fuzzy snapshot（但 Redis fork 了 COW 拿到一致快照，ZooKeeper 连这个都省，靠幂等）。</li>
+  <li><b>Postgres 乐观锁 <code>UPDATE … WHERE version = ?</code> = znode 的 version 条件更新 = fencing 的检查。</b>fencing 只是把 version 挂到"锁的任期"上、检查改成 ≤。</li>
+  <li><b>pump.fun 的 Redis 锁。</b>它保护的写本来就带条件或幂等（我答的 a），所以正确性不依赖锁，Redis 做 best effort 是正确用法。缺 ZooKeeper 的两行（fencing 号、主从切换不丢锁）在这个前提下不疼。会疼的场景：哪天有人用它保护一个不带条件、不幂等、改钱的写。</li>
+  <li><b>老版 Kafka 的 controller 在 ZooKeeper 上改 partition 分配</b>，就是"新 leader 改几千个 znode"的 ready-znode 场景；broker 注册就是 /nodes 下的 ephemeral 节点。</li>
+  <li><b>Raft term / ZooKeeper epoch / Kafka leader epoch / fencing token</b>：同一个东西，一个单调号让迟到的旧 leader 发的任何东西被拒。六周收尾要做的那张表又多了一列。</li>
+</ul>
+
+<h2 id="principles">6. 通用原则清单</h2>
+<ol>
+  <li class="principle"><b>服务器端不替任何客户端等另一个客户端。</b>一旦等，一个慢客户端就能拖住所有人；把等搬到客户端，服务器只留一条轻登记。</li>
+  <li class="principle"><b>只把必须全局有序的东西放到共识协议里。</b>ZooKeeper 只有写顺序走 Zab，读、watch、FIFO、session 全是单机本地逻辑，这是读吞吐线性涨的全部原因。</li>
+  <li class="principle"><b>精确地说出你保证什么、不保证什么。</b>"写全序 + 自己 FIFO + 要最新自己 sync"比笼统的"读写一致"更弱但更有用，配方只依赖这几条就一定对。</li>
+  <li class="principle"><b>你自己的写把你连的副本钉在那个位置。</b>要确定读到某个写之前的一切，发一个写（或 sync）比任何"等一会儿"都可靠。</li>
+  <li class="principle"><b>通知必须先于新状态到达。</b>否则读者会在不知情的情况下用半套数据；单线程 apply 时顺手发通知就免费拿到这条。</li>
+  <li class="principle"><b>只叫醒一个人。</b>等待者 watch 前一个而不是公共节点，释放一次 1 条消息而不是 3000 条，而且省掉的 1000 条是昂贵的写。</li>
+  <li class="principle"><b>幂等事务可以换掉冻结。</b>快照不一致没关系，只要从起点起全部按序重放会收敛；前提是日志里写的是"设成 X"不是"+1"。</li>
+  <li class="principle"><b>客户端带着自己的水位走。</b>换副本时把最后见过的位置交给新副本，新副本不够高就不服务，monotonic reads 用一个标量就够（因为有全序）。</li>
+  <li class="principle"><b>判死一定会判错，所以安全不能建在判死上。</b>锁服务判死只决定锁什么时候可以给下一个人，不决定上一个人的写会不会生效。</li>
+  <li class="principle"><b>锁服务发号，资源认号，认号用资源自己的条件写。</b>任何分布式锁单独都不是正确性基石；基石是资源那一层的乐观检查，锁只是减少冲突。</li>
+  <li class="principle"><b>token 要在拿锁时冻住，而且要跨 failover 单调。</b>带"当前号"会让 fencing 失效；单机 INCR 在主从异步切换后可能倒退，多数派落盘 + epoch 高位才不倒退。</li>
+  <li class="principle"><b>同一个刻度盘可以拧相反的默认值。</b>ZooKeeper 默认 follower 本地读、按需 sync；etcd 默认 linearizable、按需降级。选哪个取决于读写比和能不能接受旧值，不是谁对谁错。</li>
+</ol>
+
+<h2 id="recall">7. 复述结果与回忆清单</h2>
+<table>
+<tr><th>道</th><th>考点</th><th>结果</th></tr>
+<tr><td>1</td><td>B 为什么读到 A 的新配置</td><td>半虚：写拖 follower、全序都对；"B 的 create 为什么排在 A 的 delete 后"（create 成功的条件）要提示</td></tr>
+<tr><td>2</td><td>fencing</td><td>清楚：资源的条件写拦、token 来自 create</td></tr>
+<tr><td>3</td><td>只 watch 前一个</td><td>半虚：herd effect 对；"抢锁是 create 是写"追了两次</td></tr>
+<tr><td>4</td><td>读涨写降</td><td>读清楚；写降的原因虚（leader fan-out 份数）</td></tr>
+<tr><td>5</td><td>Raft 三档读</td><td>清楚（etcd 默认不知道，知识点）</td></tr>
+</table>
+<p>三处虚的共同点：<b>"某个操作是读还是写、走不走 leader"</b>这一层还没自动化。回忆题（progress.md 反复回忆清单）：① B 的 create(/lock) 为什么排在 A 的 delete 后；② 旧版锁 1000 人醒来各自做什么、是读是写；③ 写吞吐随 server 数降的根因。外加 Raft Figure 8 那条。</p>
+
+<h2 id="reading">8. 延伸阅读</h2>
+<ul>
+  <li>Hunt, Konar, Junqueira, Reed. <a href="https://pdos.csail.mit.edu/6.824/papers/zookeeper.pdf">ZooKeeper: Wait-free coordination for Internet-scale systems</a>. USENIX ATC 2010. 本篇。</li>
+  <li>Reed, Junqueira. <a href="https://dl.acm.org/doi/10.1145/1529974.1529978">A simple totally ordered broadcast protocol</a>. LADIS 2008. Zab 本体：PROPOSAL/ACK/COMMIT、zxid = epoch:counter、恢复时 DIFF/SNAP。本篇正文把这些留给了它。</li>
+  <li>MIT 6.5840 <a href="https://pdos.csail.mit.edu/6.824/notes/l-zookeeper.txt">ZooKeeper lecture notes</a> 与 <a href="https://pdos.csail.mit.edu/6.824/papers/zookeeper-faq.txt">FAQ</a>：sync() 的超时假设那条缝、"每个客户端看到一致的只往前走的前缀"的说法。</li>
+  <li>Burrows. <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/">The Chubby lock service for loosely-coupled distributed systems</a>. OSDI 2006. ZooKeeper 的对照组：服务器端锁、客户端缓存由服务器失效、sequencer（fencing token 的原型）。</li>
+  <li>Kleppmann. <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">How to do distributed locking</a> (2016) 与 Antirez 的回应 <a href="http://antirez.com/news/101">Is Redlock safe?</a>。fencing token 的来源，Redlock 争论。</li>
+  <li>Kleppmann. <i>Designing Data-Intensive Applications</i> 第 7 章（read skew、快照隔离，fuzzy snapshot 对应的那一节）、第 8 章（进程暂停、fencing token）、第 9 章（linearizability vs causal）。中译 <a href="https://ddia.vonng.com/">ddia.vonng.com</a>。</li>
+  <li>Terry et al. <a href="https://dl.acm.org/doi/10.1109/PDIS.1994.331722">Session guarantees for weakly consistent replicated data</a>. PDIS 1994 (Bayou). monotonic reads / read-your-writes 的原始定义，ZooKeeper 换 server 的 zxid 检查就是其中一条。</li>
+  <li>Apache Curator <a href="https://curator.apache.org/docs/recipes">Recipes</a>：生产上没人手写锁配方，都用这里的 InterProcessMutex / LeaderLatch。</li>
+  <li>etcd 文档 <a href="https://etcd.io/docs/latest/learning/api_guarantees/">API guarantees</a>：linearizable 默认、serializable 读的降级开关，和 ZooKeeper 相反的默认值。</li>
+  <li>Ongaro, Ousterhout. <a href="https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf">In Search of an Understandable Consensus Algorithm</a>. 第 8 节 leader 读前的 heartbeat 确认、ReadIndex 的出处；§5.4.2 Figure 8。</li>
+</ul>
+
+</div>
+</body>
+</html>
