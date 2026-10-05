@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClickHouse 从第一性原理 — 列存、MergeTree、去重的真相，以及一次替换 Timescale 的论证</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>ClickHouse 从第一性原理 — 列存、MergeTree、去重的真相，以及一次替换 Timescale 的论证</h1>
+  <div class="meta">
+    <span class="tag">topic 拆解</span><span class="tag">存储引擎</span>
+    深读日期：2026-10-01 → 2026-10-05（5 天，一个 session）·
+    起因：想用 self-host ClickHouse 做 pump.fun 的 price chart，替掉现有的 Timescale ·
+    过程中参考：<a href="https://www.helius.dev/blog/migrating-from-clickhouse-to-rocksdb">Helius: Migrating from ClickHouse to RocksDB</a>
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">总结：ClickHouse 是什么、不是什么</a></li>
+    <li><a href="#debate">核心争论：去重到底谁负责</a></li>
+    <li><a href="#stations">八站机制拆解</a></li>
+    <li><a href="#qa">我的疑问与解惑（本笔记最有价值的部分）</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. 总结：ClickHouse 是什么、不是什么</h2>
+
+<p><b>它解决的问题只有一种形状。</b>"读很多行、只要几列、输出很少行"——K 线、全市场成交量、某个钱包的全部历史聚合。相反的形状是"按 key 查一行、要所有列"（OLTP 点查）。一个存储引擎只能把其中一种做到极致，这是物理决定的。ClickHouse 把第一种做到极致，代价是第二种很差。</p>
+
+<p><b>快的全部来源是三个倍数叠加，没有魔法。</b>（1）列存：只读你碰的列，一行 200 字节的成交画 K 线只要 24 字节，8 倍；（2）压缩：按 <code>(mint, ts)</code> 排好序之后每一列的相邻值长得很像，Delta/ZSTD 再压 5–10 倍；（3）向量化执行 + 多核：内存里数据仍是一列一个数组，SIMD 一条指令算 4–8 个值，16 个核各扫一段。三个叠起来是 Postgres 行存的几百到上千倍扫描速度。</p>
+
+<p><b>磁盘上是一堆不可变的、内部排好序的 part。</b>每次 INSERT = 排序这一批 → 写一个 part 目录 → 原子 rename 可见。Part 内部按 ORDER BY 排好，每 8192 行一个 granule，稀疏索引只记每个 granule 第一行的键（10 亿行 49 MB，常驻内存）；每列一个 .bin（压缩块串）加一个 .mrk（granule → 字节偏移）。Part 之间按<b>到达时间</b>切，所以键范围完全重叠——这一个事实是后面一半问题的根源：点查要碰每个 part、Replacing 去重不保证收敛、AggregatingMergeTree 查询必须 GROUP BY。后台 merge 把小 part 归并成大 part，是列存上唯一负担得起的写操作。</p>
+
+<p><b>家族引擎 = merge 时顺手对"键相同的相邻行"做点事。</b>Replacing 留版本大的，Summing 相加，Aggregating 合并聚合状态，Collapsing 成对抵消。全部是"最终"语义：merge 什么时候跑你不控制，所以查询必须兜底（FINAL 或 GROUP BY）。Materialized view 不是 Postgres 那种物化视图，是 INSERT 触发器：对刚插入的这一批做 SELECT，结果写进目标表；它没有记忆、只看当前批。K 线的标准做法是 MV 写局部值到 AggregatingMergeTree，merge 和查询时的 GROUP BY 用同一套 max/min/sum 合并。</p>
+
+<p><b>去重是写入方的责任，不是引擎的。</b>ClickHouse 只给两个弱保证：INSERT 入口按 token/块哈希丢弃"最近 N 批里见过的同一批"（默认 N=1000，单机表默认关着），以及 Replacing 在 merge 时的最终去重。重复一旦进了 trades，MV 已经把它算进 candles 的 volume，事后去重救不回来。所以要在 INSERT 之前拦住：确定性幂等键 + 以 Kafka offset 区间为 batch 边界的 token + 短窗口 Redis 集合 + 凌晨重算兜底，并且写入顺序必须是 ClickHouse → Redis → commit offset。迟到的数据反而是免费的：没有"窗口已关闭"这个概念，迟到的一行就是一个新 part，merge 和 GROUP BY 自动把它合进正确的桶。</p>
+
+<p><b>副本靠 Keeper（自带的 Raft KV）协调，但不需要 leader。</b>Part 不可变、block 编号全局唯一，所以两个副本同时接 INSERT 只是各自多出一个 part，不存在"同一行被两边改"。复制的是压缩后的 part，不是 WAL 页——这是它和 Postgres 复制在写放大上的本质差别。Keeper 存复制日志、每个副本的 part 清单、去重表，几百 MB 内存，三票多数派。</p>
+
+<p><b>它哪里痛。</b>随机 key 点查（Helius 的 getTransaction：一次碰 20 个 part × 一个 granule × N 列 = 60 次 IO 只为了 1 行，再乘几万 QPS）；没有 unique constraint；UPDATE/DELETE 是重写 part 的 mutation；JOIN 弱；1 秒批量写入而不是行级新鲜度。多对多关系（一笔交易涉及 30 个地址）逼你把范围查询拆成一堆点查，这正是 Helius 放弃它的原因；而 pump.fun 的一笔 trade 只有一个 user 一个 mint，一对一反范式化两份整行就够，不会碰到那个问题。</p>
+
+<p><b>这次 deep dive 的落点。</b>走完机制之后，花了同样多的时间在"要不要用、和什么比"上：修 Timescale、Aurora + trigger、Flink + Aurora/DDB、QuestDB、StarRocks、Pinot 各自的形状都摆了一遍。结论是 ClickHouse 是三种访问模式（K 线范围聚合、钱包历史范围扫描、全市场即席分析）都"够用"的唯一候选，赢在扫描和隔离（无锁、按用户限资源），输在去重和点查。最后写成了一份给团队的提案，并请一个对抗性 reviewer 把它拆了一遍再补。</p>
+
+<h2 id="debate">2. 核心争论：去重到底谁负责</h2>
+
+<p>这个问题跨了十几个回合，每一轮我都在追问"你声称的保证到底在什么条件下成立"，每一轮答案都比上一轮更窄。完整的推导链：</p>
+
+<blockquote>
+<p><b>起点：</b>如果 Kafka 重投，ClickHouse 里就有重复的 trade。ReplacingMergeTree 能去重吧？</p>
+<p><b>→</b> 能，但只在 merge 时、只对合进同一个 part 的行生效，而且不保证 merge 什么时候发生、两个 part 会不会被合到一起。merge 之前裸的 <code>count()</code>/<code>sum()</code> 就是错的；merge 之后也不一定对。</p>
+<p><b>→ 那 MV 算 candles 时顺便去重？</b> 做不到，而且是结构性的：MV 每次只看到眼前这一批，没有"这个 signature 我见过没有"的记忆，连查目标表的能力都没有。重投几乎总是跨批的。而且局部 sum 一旦写进不可变 part，没法从里面减掉一笔。</p>
+<p><b>→ 所以去重必须在 INSERT 之前。</b> 先把问题缩小：OHLC 四个值天生幂等（重复一笔 max 还是那个 max），<code>count</code> 可以用 <code>uniqExact(signature)</code>，只有 volume（sum）怕重复。</p>
+<p><b>→ 但世上没有 exactly-once delivery。</b> 对，有的是 effectively-once：不阻止重投，让重投没有效果。三层：ClickHouse 入口按 <code>insert_deduplication_token</code>（= topic-partition-offset 区间）丢整批；consumer 里 Redis SET 存最近 10 分钟的 signature 做行级兜底；凌晨从 trades 重算昨天的 candles 让损害有界。</p>
+<p><b>→ "dedupe within same part，所以你假设最终只有一个 part？"</b> 不是——这里混了两种去重。token 去重发生在 INSERT 入口、在任何 part 写出来之前，和 part 没关系；Replacing 去重发生在 merge 里。方案用的是前者，trades 甚至可以是普通 MergeTree。</p>
+<p><b>→ "标准做法是先写 Redis 再决定写不写 ClickHouse，但写完 Redis 崩了呢？"</b> 那就是永久的静默丢失——经典 dual-write。解法是改顺序：先写事实的权威来源（ClickHouse，带 token），成功后再写辅助状态（Redis），最后 commit offset。逐个缝隙检查：没有一个缝隙丢数据，最坏是重复 INSERT，而重复正是 token 层负责吃的。Redis 在前面当过滤器时只能可靠地说"没见过"，不能可靠地说"见过"。</p>
+<p><b>→ "你不是说 ClickHouse 的去重有限制吗？"</b> 是，默认只记最近 1000 批，每秒一批就是 17–33 分钟。危险组合 = 恰好崩在"CH 成功、Redis 未写"那几毫秒 × 停机超过窗口。堵法：把窗口调到 100,000（几 MB 内存）；重启时先问 ClickHouse <code>max(offset)</code> 再决定从哪消费，不盲目重放；对账兜底。</p>
+<p><b>→ "token 存哪？另一个 table？"</b> 不是表，是表目录下的 <code>deduplication_logs/</code>（单机）或 Keeper 的 <code>/blocks/</code>（Replicated）。单机表默认窗口是 0——<b>默认根本不去重</b>，很多人踩的坑。</p>
+<p><b>→ 最后一步：</b>交易 ID 用 <code>(slot, tx_index, instruction_index)</code> 确定性推导，不需要查表、并行 consumer 零协调、Spark 回填和实时路径算出同一个值。有了完美的幂等键，去重从研究问题变成工程问题。</p>
+</blockquote>
+
+<p>跨两个系统没有概率为零的方案——除非它们在同一个事务里。工程上的目标是：漏掉需要多个独立的坏事同时发生，漏掉之后损害有界且会自愈。这是和 Postgres（unique index 白送、trigger 和去重同一事务原子完成）最根本的思路差异，也是对抗 reviewer 要求我在提案里主动写出来的 ClickHouse 弱项。</p>
+
+<h2 id="stations">3. 八站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站：为什么行存做分析会死</h3>
+<p>磁盘按块搬字节，不认识"列"。行存里一笔 trade 约 200 字节，K 线只要 timestamp + price + sol_amount = 24 字节，但 24 字节和旁边 176 字节的 signature、user 粘在一起，必须全搬再扔。</p>
+<pre><code>10 亿笔成交:
+行存全扫:    10亿 × 200 B = 200 GB → NVMe 3 GB/s → ~67 秒
+列存读 3 列: 10亿 ×  24 B =  24 GB →              ~8 秒
+再压 10 倍:               2.4 GB →              &lt;1 秒</code></pre>
+<p>代价：一行拆到 N 个文件。插 1 行写 N 个文件；改 1 个字段要在压缩块里找"第几个"；按主键取 1 行要去 N 个文件各捞一个值。ClickHouse 后面所有设计都是在回答"接受了这个代价之后，怎么把写入和更新的痛苦降到能忍"。Timescale 的 compression 做的事就是把一段时间的行转成列存段——所以它压缩后变快不只是因为变小。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站：MergeTree 在磁盘上长什么样</h3>
+<p>定位 10 亿行里的 50 万行，两条路：给每行建 B-tree（索引比数据大，且零碎写入）；或者把数据物理排好序，只记路标。MergeTree 选后者：<b>排序 + 稀疏索引</b>，每 8192 行一条。</p>
+<pre><code>10亿行 / 8192 ≈ 122 万条 × 40 B ≈ 49 MB 索引，常驻内存，二分查找零 IO
+
+granule:  8192 行，最小读取单位（要 1 行也读整个）
+mark:     每列一个 .mrk，第 37 条 = (压缩块在 .bin 的偏移, 解压后跳几行)
+part:     一个目录，内部完全有序，不可变；表 = 一堆 part
+partition: part 名的第一段（202609_1_1_0），PARTITION BY 的表达式值；part 不跨 partition</code></pre>
+<p>三层单位叠起来：OS page 4 KB（内核管）→ 压缩块 64 KB–1 MB（物理 IO 单位，按字节）→ granule 8192 行（索引单位，按行，10 MB 封顶）。granule 必须按行定义是因为索引要跨列对齐：is_buy 8192 行 8 KB、signature 8192 行 720 KB，按字节切边界对不上。8192 × 8 B = 64 KB 不是巧合——最常见的 8 字节列一个 granule 刚好一个压缩块。</p>
+<p><b>ORDER BY 是 schema 里最重要的一行。</b><code>(mint, ts)</code>：一个币的行连续，二分两次读几十个 granule；<code>(ts, mint)</code>：一个币散在时间段的每个 granule 里，索引废。规则：等号过滤的列在前，范围过滤的在后。它是押注——押"按币查"是主流，"按时间横切"就得认慢或另建副本（projection）。PRIMARY KEY 可以是 ORDER BY 的前缀：后面的列只决定 granule 内部顺序，不进索引。</p>
+<p>其他列<b>排列</b>和排序键一致（第 i 个值属于同一行），但<b>值不有序</b>——所以不能二分，只能靠 skip index 排除。Part 小于 10 MB 时是 compact（所有列一个文件），merge 后转 wide。</p>
+</div>
+
+<div class="station">
+<h3>第 3 站：压缩 —— 排好序的列为什么能压 10 倍</h3>
+<p>压缩不是省盘，是提速：磁盘 3 GB/s 全机共享，LZ4 解压一核 4 GB/s，16 核 64 GB/s。压 10 倍 = 把磁盘字节换成便宜且并行的 CPU 周期。</p>
+<p>通用压缩器只认"最近几十 KB 里重复的字节串"。按 <code>(mint, ts)</code> 排好后：mint 列是同一个 32 字节重复 50 万次（≈ 0 B/行）；timestamp 单调递增（高 7 字节一样）；price 慢变；signature 随机（压不动，1.0）。<b>压缩率是 ORDER BY 决定的</b>，一个决定两头收益。</p>
+<p>codec 是"懂数字的变形"，让 LZ4 看到更多重复：</p>
+<pre><code>Delta:        1727740800 1727740801 1727740801 1727740803 → 1727740800 1 0 2   (ts, slot, tx_id)
+DoubleDelta:  等间隔序列 delta 恒定 → 全 0  (K 线表的 bucket；Gorilla 论文 2015)
+Gorilla:      float 和前值 XOR，相近 float 高位相同 → 长串 0 + 几个有效 bit，只存那几个
+T64:          砍掉 64 个值里用不到的高位 bit
+LowCardinality: 字典编码，不同值 &lt; 1 万才用；别对 mint 用（字典 per part，几百万 mint 字典比数据大）</code></pre>
+<p>对 pump.fun 说实话：bonding curve 每笔都动价格，XOR == 0 基本不出现，一笔动 0.5% 意味着尾数第 8 位起就不同，Gorilla 只省 20–30%。更好：存链上的整数 <code>virtual_sol_reserves / virtual_token_reserves</code> + Delta，price 查询时现算，精确且压得好。codec 的选择只看一件事：<b>相邻两个值差在哪里</b>——差在数值小幅变动 → Delta；间隔恒定 → DoubleDelta；大部分时间不变 → Gorilla。</p>
+<p>LZ4 默认（快）、ZSTD 压得好 1.5–2 倍解压慢 4 倍；不确定就 <code>ZSTD(1)</code>；可以按 TTL 分层重压。验证：<code>system.columns</code> 的 <code>data_compressed_bytes / data_uncompressed_bytes</code>。</p>
+</div>
+
+<div class="station">
+<h3>第 4 站：写入 —— 每次 INSERT 都是一个新 part</h3>
+<p>Part 不可变且有序，新数据只能变成新 part：一条 INSERT = 内存排序 → 写 tmp_ 目录 → 原子 rename。与行数无关，插 1 行也建目录、写 idx/bin/mrk/checksums。</p>
+<pre><code>查询要对每个 part 查索引 → part 数线性拖慢查询，文件数拖垮文件系统
+parts_to_delay_insert = 1000 / parts_to_throw_insert = 3000（按 partition 算；老版本 150/300）
+
+pump.fun ~600 笔/秒:
+  每笔一条 INSERT → 600 part/秒 → 5 秒撞墙
+  每秒攒一批     → 1 part/秒  → 稳态几十到两三百个 active part</code></pre>
+<p>后台 merge = 多路归并，顺序读顺序写，part 名记血统（<code>202609_1_3_1</code> = block 1–3，层级 1），旧 part 8 分钟后删。合并是对数阶梯：level 0→1 约 10 秒，→2 约 1–2 分钟，→3 约 10–20 分钟……到 150 GB 不再合。调度器只合大小相近的（避免为 500 KB 重写 50 GB），落单的小 part 可能多待几分钟。写放大 ≈ log₁₀(最终/初始) ≈ 10 次，对 5 GB/天就是 0.6 MB/s，从来不是瓶颈；要盯的是 merge 跟不跟得上（<code>system.merges</code>、<code>system.parts</code> 按 level 分布）。</p>
+<p><b>原子性 = 一次 rename。</b>没有事务日志、没有 MVCC，"可见"的定义就是目录存在且不叫 tmp_。一批跨两个 partition 就是两个 part、两次 rename，中间几毫秒能看到一半——哪怕第二个 part 只有 2 行（part 没有下限，这也是为什么 <code>PARTITION BY mint</code> 一秒钟写炸，<code>max_partitions_per_insert_block = 100</code> 专门防这个）。崩了 tmp_ 目录直接删，不需要 recovery——所以它敢默认不 fsync。</p>
+<p>UPDATE/DELETE 是 mutation：重写所有可能包含目标行的 part。哲学是"不要更新，要追加"。lightweight DELETE 写掩码列，DROP PARTITION 瞬间——时间 partition 的最大实际好处，TTL 自动做。攒批三条路：consumer 自己攒（推荐）、<code>async_insert</code> 服务端攒、Kafka 表引擎（POC 可以，生产不透明）。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站：MergeTree 家族、MV、局部值</h3>
+<p>主线一句话：merge 时每一行都要过手，排序键相同的行一定相邻，所以可以顺手处理。Replacing 留版本大的；Summing 相加；Aggregating 按每列声明的函数合并；Collapsing +1/-1 抵消。磁盘结构、索引、写入模型和普通 MergeTree 完全一样。</p>
+<p><b>三个推论。</b>（1）合并是最终的，查询要兜底：Replacing 用 FINAL 或 GROUP BY + argMax(version)，Aggregating 用 GROUP BY + -Merge 后缀。（2）K 线 = AggregatingMergeTree + MV：MV 对每批做 GROUP BY (mint, 分钟)，写局部 max/min/sum/带时间戳的 open/close；一分钟 30 批 = 30 行局部值 → merge 合成 1 行；查询 GROUP BY 兜底。局部值的意义是<b>可合并且合并便宜</b>：max 的 max 还是 max（结合律），读 1440 行局部值代替扫 2880 万笔原始成交。（3）家族引擎不负责去重，去重前置（见第 2 节）。</p>
+<p><b>FINAL</b> = 把后台 merge 的归并 + 引擎规则临时搬到查询里跑一遍，结果不落盘。代价是跨 part 归并排序要等所有行到齐；范围小（一个钱包、一天）几毫秒，大范围别用；23.x 后按 partition 并行，<code>do_not_merge_across_partitions_select_final</code>。</p>
+<p>让 Spark 能写、实时也能写的 schema 技巧：全部用 <code>SimpleAggregateFunction</code>——open 用 <code>min(Tuple(ts, price))</code>、close 用 <code>max(Tuple(ts, price))</code>（tuple 按字典序比），Parquet 的 struct 直接对上；批层写完整值、速层写局部值，merge 和 GROUP BY 用同一套规则，两条路径写同一张表不需要区分。批流接缝：MV 带 <code>WHERE ts &gt;= T</code>，Spark 只灌 T 之前的桶；每日重算用 <code>REPLACE PARTITION</code> 原子覆盖。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站：一条 K 线查询从 SQL 到字节</h3>
+<pre><code>1. 解析：用到的列 mint, ts, price, sol_amount，其他 15 列从此不存在
+2. 裁 partition：ts ≥ 昨天 → 只看 202609/202610 的 part
+3. 每个 part 查 primary.idx：二分 mint 再二分 ts → 73 个 granule 的清单，还没碰数据文件
+4. 把 granule 区间切给 16 个线程（切的是区间不是 part，一个大 part 也能并行）
+5. 读：每线程每次约 8 个 granule = 65,536 行一个 block，每列查 .mrk → 读压缩块 → 解压成一个数组
+   block 在内存里仍然是一列一个数组
+6. 过滤：mask = (mint_array == X) AND (ts_array ≥ T)，对数组做，SIMD 一条指令比 4–8 个
+7. 聚合：toStartOfMinute 出 key 数组 → 每线程一张 1440 行的哈希表，不加锁
+8. 合并 16 张表 → 排序 → 返回。总共几十毫秒；走 candles 表 1–2 ms</code></pre>
+<p><b>SIMD 从头讲。</b>通用寄存器 64 bit 装一个数；宽寄存器 256 bit 看成 4 个 64-bit lane，硬件上 4 个加法器并排、互不相连，一条指令同时驱动——真同时，不是轮流。比较指令每格输出全 1/全 0，再压成 bitmask。要求：4 个数在内存里<b>挨着</b>、类型相同、做的事相同——列存的内存布局天然就是这个格式，行存要先挑拣（白干）。阈值广播到 4 格不浪费：循环前做一次，占的是寄存器空间不是时间，AVX-512 还把它藏进 load 单元（<code>{1to8}</code>）。求和有依赖链，解法是 4 个累加器各吃第 0/4/8…、1/5/9…个元素（隔 4 取，不是分两半——load 读的是连续 4 个），最后横向加一次；浮点不满足结合律所以编译器不敢自动做，ClickHouse 手动拆。多核 × SIMD 两层叠加。</p>
+<p><b>Projection</b> = 同一张表内另一种排序的副本，住在每个 part 的子目录里，INSERT/merge/DROP/去重跟着 part 一起，查询 SQL 不变、优化器自动选。它是 Postgres 的 covering index——列存里指针式二级索引活不了（回表 = 解压 64 KB 取 8 字节 × N 列）。带 GROUP BY 的 aggregating projection = 住在 part 里的 AggregatingMergeTree + MV，不用建第二张表、没有接缝；代价是和主表同生共死（TTL 一起没）。要独立生命周期或级联才用 MV。</p>
+<p><b>Skip index</b> 只能排除不能定位：每 N 个 granule 存一条摘要——minmax（对和排序键相关的列如 slot 有效）、set（低基数）、bloom_filter（高基数随机列，k 个哈希置 bit，只会误判有不会误判无，默认 2.5% 误判）。对 15 亿行按 user 查：45,000 条摘要 × 2.5% ≈ 1,100 段仍要扫，"从不可用变勉强可用"，不是变快。Part 级 minmax 只对 partition key 的列、整个 part 一条。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站：副本、Keeper、为什么不需要 leader</h3>
+<p>Keeper = ClickHouse 自带的 Raft 复制 KV（ZooKeeper 的 C++ 重写），只存元数据：复制日志（"part 7 出现了"、"合并 1_5 和 6_8"）、每个副本的 part 清单、去重表、block 编号分配器。几百 MB，三票多数派，自己选 leader。你和它的全部交互是三段配置 + <code>systemctl start clickhouse-keeper</code>，不需要 k8s。</p>
+<pre><code>副本 A 收 INSERT: 向 Keeper 要 block 编号 7 → 本地写 part → 日志追加"part 7 在我这"
+副本 B 同时收 INSERT: 要到编号 8 → 本地写 → 追加"part 8"
+B 看到日志里 part 7 自己没有 → HTTP 从 A 拉目录；A 对 part 8 同样
+两边互不冲突：没有"同一行被两边改"，只有"两个不同的 part 各自出现"</code></pre>
+<p>所以写入是 multi-master，唯一的 leader 在 Keeper 内部。Postgres 需要 leader 是因为同一行可能被改要定序；ClickHouse 没有"改"只有"出现"，编号就够。复制流量 = 压缩后的 part 本身，没有索引页、没有 WAL 放大（Postgres 一行写 = 堆表 1 页 + 每个 B-tree 索引 1 页，6 个索引就是 7 页改动，这就是副本追不上 WAL 的根源）。Keeper 对读零影响；写路径每批多 3 次往返约 5–10 ms；每秒几千次小 INSERT 才会把它打成瓶颈——和 part 数量是同一枚硬币的两面。</p>
+<p>"各 host 自己读 Kafka、不要 Keeper"是真实模式：Kafka 复制的是<b>输入</b>，Keeper 复制的是<b>结果</b>。所有非 Kafka 的写（回填、DDL、mutation、REPLACE PARTITION、补节点）在前者要做 N 遍且分叉静默，后者做一次。非 Kafka 输入越多 Keeper 越划算。决策：POC 单机普通 MergeTree 什么都不配；上第二台那天加 Keeper。三个 Keeper 进程：两个搭在 CH 机器上，第三票在一台 $25 的小机器上（不能也放 CH 机器，那台一挂丢两票）。</p>
+</div>
+
+<div class="station">
+<h3>第 8 站：它哪里痛，和什么比</h3>
+<p><b>Helius 为什么放弃。</b>500 B 交易、1.3 T 地址索引，全是随机 key 点查。单次 getTransaction 7 ms 不慢，但每次要碰 20 个 part（signature 随机，每个 part 的 min/max 都覆盖全键空间，索引排除不了任何一个）× N 列 × 解压 64 KB 取 1 行 = 60 次 IO，乘几万 QPS 盘和 CPU 都在为"读 8191 行扔掉"付钱。granule 调小索引放不进内存。getTransactionsForAddress 350 ms 是因为地址表只能存指针再 fan out 100 次点查——多对多（一笔交易 30 个地址）让反范式化不可承受。RocksDB 用 bloom filter 1–2 次 IO。教训：<b>访问模式的匹配度比数据库的成熟度重要。</b></p>
+<p><b>三种访问模式各自的家。</b>K 线/trending → ClickHouse 主场；按 signature 点查 → Helius 形状，别放 ClickHouse；钱包历史 → 范围扫描，ClickHouse 可以（第二张按 (user, ts) 排的表，5–30 ms 不如 B-tree 稳），pump.fun 一对一反范式化只翻倍不翻 30 倍。</p>
+<p><b>行级新鲜度 ↔ 列存大范围读是互相拉扯的。</b>所有号称都有的系统内部都是两层：小的行存/内存缓冲 + 不可变列存块，查询两边合并。Timescale（最近 chunk 行存 + 老 chunk 列存 + cagg）、QuestDB（WAL 毫秒可见 + DEDUP UPSERT KEYS + SAMPLE BY 出 OHLC，专为行情造）、Pinot（每条事件进内存段即查 + upsert 表 + star-tree 预聚合，但五种角色 + ZK，不能预聚合 open/close，是 serving 引擎不是分析引擎）、StarRocks（主键表原生去重 + 强 join + shared-data 让本地盘可丢，但 FE/BE 脚印更大、没有时序 codec、生态小）。ClickHouse 输在新鲜度（批级）和去重，赢在扫描、压缩、运维脚印、生态。</p>
+<p><b>隔离模型是它对 Postgres 的结构性优势。</b>Postgres 里一条长查询拖垮集群有三条路径：锁队列（长 SELECT 持 ACCESS SHARE，DDL/Timescale 后台任务要 ACCESS EXCLUSIVE 排在后面，再后面所有查询排在 DDL 后面——lock convoy）、xmin 卡住全库 vacuum、读副本上的 replication conflict。鲸鱼钱包拉几百万行正是这种长查询，而且它是 serving 流量，分不去分析副本。ClickHouse 没有行锁没有 MVCC 快照，一条重查询只能通过 CPU/内存/IO 影响别人，而这三样按用户 settings profile 限死，超了杀查询不杀服务。</p>
+<p><b>机器。</b>10 TB+ 本地 NVMe 把你推到 15 TB 档（AWS 本地盘都是 7.5 TB 一块）。查证后的 us-east-1 按需价：i8ge.6xlarge（Graviton4，24 vCPU/192 GiB/2×7.5 TB，650k 读 IOPS）$2.85/h ≈ $2,080/月，比同形状的 i7ie.6xlarge（x86）便宜 10%，比两代前的 im4gn.8xlarge 还便宜；ClickHouse 对 ARM 是一等公民（官方 aarch64 包，re:Invent 2024 演示 Graviton4 比 r6i 扫描快 64%）。两副本不同 AZ + m7g.medium Keeper 第三票 + S3 备份。本地盘年丢失率约 2–5%，真正高频的是人手滑 <code>stop</code>——IAM 禁掉 Stop/Terminate、开 termination protection、只允许 reboot。分片这辈子不需要（3–6 TB 一台放得下，查询都是小范围），数据涨了先 TTL 到 S3 分层；ClickHouse 没有自动 rebalance，分片数几乎不可逆。</p>
+</div>
+
+<h2 id="qa">4. 我的疑问与解惑</h2>
+
+<h3>第 2 站：磁盘结构</h3>
+<div class="qa"><p class="q">为啥 granule 不用 OS 的 page size，比如 64 KB？</p><p class="a">granule 必须按行数定义，因为索引要跨列对齐——is_buy 8192 行 8 KB、signature 8192 行 720 KB，按字节切三列边界对不上，索引就废了。但 granule 下面那层（压缩块）确实按字节，64 KB 起步 1 MB 封顶；mark 是两层之间的桥。8192 × 8 B = 64 KB，最常见的 8 字节列一个 granule 刚好一个压缩块。OS page 对齐在这里收益小：压缩后没有对齐可言，读的是大段连续范围，page cache 自己处理。后来加了 <code>index_granularity_bytes</code> 10 MB 封顶治大 String 列。</p></div>
+<div class="qa"><p class="q">所以 mark（price.mrk）是 per column？</p><p class="a">是，必须是。primary.idx 跨列只有一个（它说"第 37 个 granule 从哪一行开始"）；但 granule 37 在 price.bin 第几个字节和在 signature.bin 第几个字节是两个不相干的数，没有公式能推，只能各记。所有 .mrk 条数相同，指向各自文件的不同位置。后果：查 3 列只打开 3 对文件。每条 16–24 B，20 列 600 MB，走 mark cache 不全常驻。</p></div>
+<div class="qa"><p class="q">那个 CREATE TABLE 怎么没提 partition key 是啥？</p><p class="a">在最后一行 <code>PARTITION BY toYYYYMM(timestamp)</code>。容易漏看是因为它不是一个列，是表达式：insert 时现场算，值相同的行归一组，值成为 part 目录名的第一段。PARTITION BY 管"分到哪个目录"，ORDER BY 管"目录内部怎么排"，两个独立决定。</p></div>
+
+<h3>第 3 站：压缩</h3>
+<div class="qa"><p class="q">XOR 那个没懂。</p><p class="a">从头：XOR 是一张差异图（相同出 0，不同出 1）。Float64 = 符号 1 + 指数 11 + 尾数 52。相近两个价格符号、指数、尾数高位都一样 → XOR 之后一长串前导 0 加中间几个有效 bit。Gorilla 只存"前导 0 几个、有效段多长、有效 bit 本身"，值没变就存 1 个 bit。诚实地说对 pump.fun 次优：每笔都动价格，一笔动 0.5% 从尾数第 8 位起就不同，只省 20–30%。改存整数 reserves + Delta。</p></div>
+
+<h3>第 4 站：写入</h3>
+<div class="qa"><p class="q">原子性那个我没懂。</p><p class="a">"可见"的定义只有一条：part 目录存在且不叫 tmp_。写到一半在 tmp_ 里查询看不见，写完一次 rename（文件系统原子操作）全部可见。一批跨两个 partition 必须写两个 part、两次 rename，中间几毫秒的查询看到 9 月那 9,998 行、看不到 10 月那 2 行。对 K 线无所谓；借贷两行这种数据不该放 ClickHouse。</p></div>
+<div class="qa"><p class="q">第二个 part 才两个 row？太小了吧，真的可能发生吗？</p><p class="a">会，每个月初都发生。part 没有大小下限：按 partition 值分组，每组一个 part。它不"等一等攒够"是因为那会引入状态（攒在哪、崩了怎么办）。几秒后下一批进来就合掉了。这条规则正好解释 <code>PARTITION BY mint</code> 为什么致命：一批 10,000 行涉及 3,000 个币 → 3,000 个 part 每个 3 行，一秒撞穿。</p></div>
+<div class="qa"><p class="q">如果我对实时性有要求，最多只能 batch 2 秒，是不是每两秒就有一个 small part？</p><p class="a">是，而且这就是设计中心。分清"每天创建多少 part"（几万很正常）和"任一时刻 active 多少"（merge 几秒内吃掉小的，稳态几十到两三百）。盯 <code>system.parts</code> 按 partition 数 active。后来又问"batch 要 10 秒吧？"——不用，1 秒就够，200 ms 也行；端到端新鲜度 Kafka 100 ms + 攒批 1 s + 落盘 50 ms ≈ 1–1.5 秒。</p></div>
+
+<h3>第 5 站：家族、MV、去重（问得最多）</h3>
+<div class="qa"><p class="q">如果 MergeTree 还没跑，select count/sum 都可能有错误，如果我有 duplicate？</p><p class="a">是，而且 merge 完也不保证——两个大 part 可能永远不再合并，跨 partition 永远不会。Replacing 的承诺只有"merge 时键相同留一行"，不承诺何时、不承诺收敛。要么查询时 FINAL/GROUP BY 兜底，要么重复根本进不来。</p></div>
+<div class="qa"><p class="q">有没有办法同时做 dedupe 和 aggregation？</p><p class="a">没有引擎能在 merge 里同时做两件事。缩小问题：open/high/low/close 天生不怕重复，count 用 <code>uniqExactState(signature)</code>，只有 volume 需要上游守住。路 A（推荐）：INSERT 前去重；路 B：refreshable MV 每 10 秒从 trades FINAL 重算最近几根。去重在 ClickHouse 世界观里是写入方的责任。</p></div>
+<div class="qa"><p class="q">materialized view 是啥意思，怎么 work？</p><p class="a">ClickHouse 的 MV 不是视图，是 INSERT 触发器——和 Postgres 的 materialized view 名字一样东西完全不同。每当一批行插进源表，把这一批喂给 SELECT，输出 INSERT 进目标表。它从不读整张源表；只在 INSERT 时触发（merge/mutation/TTL 它不知道）；建它之前的数据看不到（POPULATE 或自己回填）；能级联。类比：收银机每打一张小票，记账员看一眼在"今日销量"本子上加几笔，不翻历史、不管退单。</p></div>
+<div class="qa"><p class="q">candles_1m part 里只有一些局部的 max/min/sum 有啥意义呢？</p><p class="a">局部值本身没意义，意义在于能合并且合并便宜：30 个局部 max 的 max 精确等于对 2 万笔原始成交求 max。查一天 K 线从 2880 万行变成 ≤ 43,200 行局部值（merge 完 1,440 行）。MV 在 10:05:02 收到第一批时这一分钟还没结束，不可能知道最终 high；part 又不可变不能改之前那行，所以只能追加局部值让 merge 合。选举计票：票站报数单独没意义，中央加总不用重数选票。</p></div>
+<div class="qa"><p class="q">而且这个 materialized view 没办法 dedupe。</p><p class="a">对，结构性的：去重需要记忆，MV 每批算完就忘，连查目标表的能力都没有。批内重复能 LIMIT 1 BY 处理，但重投几乎总是跨批。事后也补不了：局部 sum 已进不可变 part。所以去重必须在 INSERT 之前。</p></div>
+<div class="qa"><p class="q">但是不幸的是，世上没有 exactly-once delivery。</p><p class="a">有的是 effectively-once：让重投没有效果。Kafka 自己的 EOS 和 AWS 的 ClientToken 都是这个模式。三层：token（= Kafka offset 区间，batch 边界由 offset 决定不由时间决定，重启后重放的是同一批同一个 token）→ Redis 10 分钟 signature 集合 → 凌晨对账重算。没有一层声称 delivery 是 exactly-once，叠起来结果是。</p></div>
+<div class="qa"><p class="q">dedupe happens within same part，所以你 assume 最终只有一个 part？</p><p class="a">不是，混了两种去重。token/块哈希去重在 INSERT 入口、任何 part 写出来之前，查"最近 1000 个 token 的列表"命中就整批丢，和 part 无关。Replacing 去重在 merge 里才受 part 限制。方案用前者，trades 可以是普通 MergeTree。局限不在 part 在列表长度：1000 批 ≈ 33 分钟。</p></div>
+<div class="qa"><p class="q">我说的是用 Redis 做去重：标准做法是先 insert Redis 再决定要不要 insert ClickHouse，但 insert Redis 之后 crash 了，这个 insert never goes to ClickHouse。</p><p class="a">你说得对，按这个顺序就是永久静默丢失，经典 dual-write。解法改顺序：先写事实的权威来源（ClickHouse 带 token），成功后 Redis，最后 commit offset。逐个缝隙：1 前崩重做；1 后 2 前崩 → Redis 没记录 → 再 INSERT → token 丢弃；2 后 3 前崩 → Redis 说见过 → 丢弃，但已在 CH 里。没有缝隙丢数据。推广：两个系统一起写，问"只写成第一个世界对不对"，答案必须是"对，只是没做完"。</p></div>
+<div class="qa"><p class="q">"再 INSERT → ClickHouse 看到同一个 token → 丢弃"——你不是说 ClickHouse 的去重是有限制的吗？</p><p class="a">是，那张表省略了条件：如果 token 还在最近 N 个里。危险组合 = 崩在毫秒缝隙 × 停机超过 33 分钟。堵法：窗口调到 100,000（几 MB，覆盖 55 小时）；重启先查 ClickHouse <code>max(kafka_offset)</code> 从那续，让 Kafka commit 只是提示、进度以权威来源为准；对账兜底。诚实地说跨两个系统没有概率为零的方案。</p></div>
+<div class="qa"><p class="q">"token 还在最近 N 个里"，这是另一个 table 吗？</p><p class="a">不是表，是内部小日志。单机：表目录下 <code>deduplication_logs/</code>，只有 <code>non_replicated_deduplication_window &gt; 0</code> 才存在，默认 0 即<b>默认不去重</b>。Replicated：Keeper 里 <code>/blocks/&lt;hash&gt;</code>，因为多副本要共享。给了 token 存 token，没给存内容哈希（行序不同哈希就变，更脆）。</p></div>
+<div class="qa"><p class="q">这是 ClickHouse 自带的功能吗？</p><p class="a">是。Replicated 表默认开（副本同步依赖它）；单机表代码一样在只是窗口默认 0，建表 SETTINGS 一行打开。<code>insert_deduplication_token</code> 是 22.x 加的。</p></div>
+<div class="qa"><p class="q">这个 FINAL 是啥意思？</p><p class="a">SELECT 修饰词："查询时现场做一次 merge，让结果等同于全部合并完的样子。"三个 part 读出来不直接吐，按 ORDER BY 归并，相邻键相同套引擎规则，结果不落盘。代价是跨 part 归并要等所有行到齐。只对家族引擎有意义。</p></div>
+<div class="qa"><p class="q">一个 partition 可以多个 parts for same column？</p><p class="a">可以，每个 part 都包含所有列。层级：表 → partition → part → 列。part 是按行切的不是按列切的；同一 partition 有多少 part 就有多少份 price.bin，各装不同的行。查 9 月的 price 要打开该 partition 下每个 active part 的 price.bin。（后来又问了一次，答案不变。）</p></div>
+<div class="qa"><p class="q">那他们会有 overlap 吗？</p><p class="a">键范围一定重叠——这是和 LSM leveled compaction 最大的结构差异。part 是按到达时间切的，每批几百个币，mint X 几乎出现在每个 part 里。后果：查 X 碰每个 part、FINAL 要跨 part 归并、Replacing 不保证收敛。RocksDB L1 以下每层文件键范围不重叠，点查每层最多一个文件；ClickHouse 不这么做因为它的查询是范围扫描，为点查优化不值。行重叠不会：active part 的 block 区间两两不相交；merge 后旧 part 留 8 分钟但快照里只有一套。</p></div>
+<div class="qa"><p class="q">我以为每个 key 只会在一个 part 里面出现。</p><p class="a">这是 ClickHouse 和 RocksDB/B-tree 最容易混的地方。part 按到达时间切不按键切；同一个键的新数据不能塞进已有 part（不可变），只能进新 part。任何时刻最近的键一定散在多个 part 里，只有不再有新数据的老键才收敛。所有 part 都像 LSM 的 L0，永远重叠，靠"范围扫描本来就要碰所有 part"把开销藏起来。</p></div>
+<div class="qa"><p class="q">update 会导致不同 parts contain 同样的 key 吗？</p><p class="a">分两种 update。<code>ALTER UPDATE</code>（mutation）不会：重写 part 原子替换，一行只在一个 active part。"插新版本"会，而且故意：两个 part 共存到 merge 时 Replacing 留 version 大的。即使没更新 ORDER BY 键也不要求唯一，两笔同一毫秒的成交合法。</p></div>
+<div class="qa"><p class="q">merge 之前呢，读的时候发生什么？</p><p class="a">不加 FINAL：每个 part 独立定位、读、过滤、直接拼接，两行 tx_id 123 两个价格，ClickHouse 不在乎。加 FINAL：各 part 输出按 ORDER BY 归并让相同键相邻，套 Replacing 规则，一行。三个选择：不管（图表）、FINAL（钱包列表，用户看得见）、自己 GROUP BY argMax。</p></div>
+<div class="qa"><p class="q">trade 的数据没有 update，都是 append。</p><p class="a">好消息，划掉站 5 大半：不需要 mutation、版本、Replacing（除非兜重复）、FINAL（除非藏重复）。唯一让同一键出现在多个 part 的是重复投递，而那是传输事故不是数据语义，解法在写入侧。保留两项：钱包表仍用 Replacing + FINAL 当保险；分叉撤回是 append 世界里唯一的非 append 事件。</p></div>
+<div class="qa"><p class="q">这种一秒 batch 产生的 part 一般多久会 merge 到更大的？</p><p class="a">对数阶梯：level 0→1 约 10 秒，→2 一两分钟，→3 十几分钟，到 150 GB 不再合。调度器只合大小相近的，落单小 part 可能多待几分钟直到 <code>min_age_to_force_merge_seconds</code>。candles 表的局部值几 KB 几乎即时合。看 <code>system.merges</code>、<code>system.part_log</code>、按 level 分布的 <code>system.parts</code>。</p></div>
+<div class="qa"><p class="q">MV 里面如果一个 candle 来自两个不同的 batch 怎么办？</p><p class="a">就是局部值那套：30 批 → candles 表 30 行局部值各在各的 part → AggregatingMergeTree merge 时按每列函数合并 → merge 前查询 GROUP BY 用同一套 max/min/sum 现场合。查询永远带 GROUP BY 是这张表的使用契约。前提是结合律——K 线五值都能拆，中位数不行。</p></div>
+
+<h3>第 6 站：查询执行</h3>
+<div class="qa"><p class="q">SIMD 我想理解懂一点，他是怎么同时算多个 integer？</p><p class="a">普通寄存器 64 bit 装一个数，一条 add 一个加法器算一个。SIMD 寄存器 256 bit 看成 4 个 lane，硬件上 4 个加法器并排，一条指令同时驱动，耗时和一个 add 一样。划算是因为瓶颈从来不是算术电路而是取指/译码流水线，每条昂贵指令干 4–8 倍的活。比较指令每 lane 出全 1/全 0 再压成 bitmask。条件：数据挨着、类型相同、无逐元素分支——列存天然满足，行存要先挑拣。</p></div>
+<div class="qa"><p class="q">所以他一次把 array 里面的四个 number load 到 CPU 同时做 filter？</p><p class="a">对，三条指令一轮：vmovdqu 装连续 4 个 Int64 → vpcmpgtq 4 格同时比 → vmovmskpd 压成 4 个 bit，i += 4。65,536 个走 16,384 轮。load 一次 32 字节正好半个 cache line，4 个数挨着一次内存访问够；散在 4 行 struct 里要 4 次 load 再拼，收益被吃掉。</p></div>
+<div class="qa"><p class="q">但是 ymm1 占了四个相同的 number 是不是浪费？</p><p class="a">不浪费：广播在循环前做一次，之后 16,384 轮不动，摊到每轮是零；占的是 24 字节寄存器空间不是时间，16 个 ymm 一个循环用三五个；硬件刻意让所有 lane 对称独立，指令集最简单。AVX-512 的 <code>{1to8}</code> 把广播藏进 load 单元——你的直觉是对的，硬件设计者也这么想。</p></div>
+<div class="qa"><p class="q">那如果求一个 array 的 sum 呢？</p><p class="a">求和有依赖链（每步等上一步），SIMD 套不上。解法：4 个局部和各吃第 0/4/8…、1/5/9…个，纵向加 16,384 轮，最后横向加一次。追问"是把 array 分两半然后两两相加？"——不是分两半，是隔 4 取：load 读连续 4 个，a[0..3] 对位加到 4 个累加器。分两半是多线程的做法，两层叠：线程切大块，线程内隔 4 走 SIMD。浮点不满足结合律编译器不敢自动做，ClickHouse 手动拆，sum(Float64) 最后几位可能差 1 ulp。</p></div>
+<div class="qa"><p class="q">projection 就是 secondary index 吗？</p><p class="a">目的一样结构不一样，准确说是 covering index。Postgres 二级索引存"键 → 行指针"要回表，而回表（解压 64 KB 取 8 字节 × N 列）是列存最烂的操作，所以指针式索引在列存里没生存空间，唯一可行是索引里直接带数据——完整的、有自己稀疏索引和压缩块的列文件副本。名字撞车的 skip index 不是二级索引：它不能定位只能排除。</p></div>
+<div class="qa"><p class="q">那 skip index 怎么实现的？</p><p class="a">每 N 个 granule 一条某列的摘要，回答"这段有没有可能有"。插在 primary.idx 之后、读数据之前，只做减法。minmax（16 字节，对与排序相关的列如 slot 有效）、set(K)（低基数）、bloom_filter（k 个哈希置 bit，有任何 0 一定没有，全 1 可能有，默认 2.5% 误判）。按 user 查 15 亿行：45,000 段 × 2.5% ≈ 1,100 段仍扫 3,600 万行——比全扫少 40 倍但还是几百毫秒，要快还是 projection 或独立表。</p></div>
+<div class="qa"><p class="q">每个 part 不是已经存 max 和 min 吗？</p><p class="a">只对 partition key 的列（<code>minmax_timestamp.idx</code>），粒度是整个 part。站 2 我说"每列"说宽了。一个 part 覆盖一个月，part 级 minmax 排除不了月内任何东西；skip index 把同一 part 切成 30 万段各自 minmax 才能跳。同一个想法的两档：最粗（partition 裁剪，自动）和细（skip index，手动）。</p></div>
+<div class="qa"><p class="q">其他列也是 sort 的啊。</p><p class="a">不是。所有列<b>排列</b>一样（第 i 个值属于同一行），但只有 ORDER BY 的列<b>值有序</b>。price 列 0.0312 → 0.0315 → 0.0311 → 1.2 乱的；slot 段内递增段间跳（与时间相关所以 minmax 有用）；user 完全随机。不有序就不能二分，只能排除。列和排序键相关 → minmax；低基数 → set；高基数随机 → bloom。</p></div>
+<div class="qa"><p class="q">ClickHouse 支持 secondary sort key 吗？</p><p class="a">没有 B-tree 意义上的。一张表一个物理排序，想按另一个键快只有副本（projection / 第二张表 + MV）或 skip index 排除。容易混的是 PRIMARY KEY 可以是 ORDER BY 的前缀：<code>ORDER BY (mint, ts, tx_id) PRIMARY KEY (mint, ts)</code>，tx_id 决定 granule 内部顺序但不进索引，索引更小、压缩更细、Replacing 去重键可以是三列。</p></div>
+
+<h3>第 7–8 站：部署、副本、成本</h3>
+<div class="qa"><p class="q">actually 要不要单机？单机能 handle production read traffic 吗？我们 chart TPS 300 左右。</p><p class="a">容量不是问题：300 TPS × 2 ms（candles 一天）≈ 0.6 核，全是重查询也 3 核。单机的风险只有可用性和持久性。持久性靠 Kafka 保留 + fsync 不靠第二台；可用性只能靠副本。POC 单机；上线 2 台互为副本（不是分片）；日常运维（升级要重启）才是高频停机源，不是硬件故障。</p></div>
+<div class="qa"><p class="q">ok 但是我们的 trades 一共有 7 TB 数据 besides price chart。</p><p class="a">7 TB 是行存未压缩，ClickHouse 约 100 B/行含 signature → ~2.8 TB，图表列约 10 B/行 → ~300 GB。单机结论不变，多三件事：历史回填按月大批灌（不是 600 行一批，merge 写放大 30 TB 后台 IO）；冷热分层 TTL 到 S3；真正的问题是这 7 TB 除了图表还服务什么——每种访问模式一张表。</p></div>
+<div class="qa"><p class="q">他们（Helius）为啥放弃 ClickHouse？get transaction by signature 应该还挺快吧，by address 应该是 sequential scan 也行吧？</p><p class="a">单次都对，Helius 的问题在两处。点查：signature 随机，每个 part 的 min/max 都覆盖全键空间，索引排除不了任何 part → 20 个 part × N 列 × 解压 64 KB 取 1 行 = 60 IO，单次 7 ms 不慢但每次比 KV 贵 30–50 倍，乘几万 QPS 盘打满；granule 调小索引放不进内存。按地址：范围扫描本身没问题，慢在第二跳——地址表只能存指针，拿到签名再 fan out 100 次点查，因为一笔交易涉及 30 个地址，反范式化 = 300 TB × 20。pump.fun 一笔 trade 一个 user 一个 mint，一对一存两份整行一跳结束。</p></div>
+<div class="qa"><p class="q">或者就用 Postgres（Aurora）行吗？candle 用 trigger 同时算行吗？</p><p class="a">画图行：candles 表 + (mint, bucket) B-tree，聚合用 statement 级 trigger + transition table（不是 row 级，那是热行每分钟锁几千次），而且 <code>ON CONFLICT (signature) DO NOTHING</code> 挡掉的行不出现在 transition table 里——去重、写入、聚合同一事务原子完成，这是 ClickHouse 结构上做不到的。但 7 TB 原始 trades 放 Aurora 不合适（无列压缩，付钱存不读的历史），而且这整套是 reinvent Timescale：分区、压缩、cagg、乱序、回填全部自己造，造出来是一个功能更少没人维护的 Timescale。</p></div>
+<div class="qa"><p class="q">回填是另一个 pain point：回填几个 TB 的 trades 让 Timescale 或 ClickHouse 重建 chart 不现实，我需要用 Spark 算好 price chart 直接回填。</p><p class="a">这把聚合从数据库挪出去了，数据库退化成"存 candles、读 candles、能被批量灌、能和实时尾巴接上"——lambda。ClickHouse 这里舒服：<code>INSERT ... FROM s3()</code> 一条 SQL GB/s，<code>REPLACE PARTITION</code> 原子换整月，SimpleAggregateFunction(Tuple) 让 Spark 的 Parquet 和 MV 的局部值落同一张表。后来你说"晕，我在 Timescale 也是这么做的，做了个 union table"——对，我把你已经在用的模式包装成了 ClickHouse 的胜点，收回：Timescale 的 real-time aggregate + hist 表 UNION 就是同一个 lambda，这个维度上 ClickHouse 没有决定性优势。</p></div>
+<div class="qa"><p class="q">或者我干脆用 Flink 算好然后灌入一个 KV store？KV 用 DDB 还是 Postgres（Aurora）？Aurora single writer 回填会慢吧？</p><p class="a">Flink + KV 是 serving 最干净、运维最重、只能回答预算好的问题的方案；它的真正好处是 checkpoint 把 offset + 去重集合 + 当前 K 线原子快照，三层去重整体消失。KV 选 Aurora 不选 DDB：跨币查询（trending）DDB 做不了；300 TPS × 一天 1440 根的 DDB 读账单 $3–4k/月；回填按 item 计费。Single writer 限制的是写入走一台不是单线程：按月分表并行 COPY + 后建索引 + attach，50 亿行半天；别让 Flink JDBC 逐批写。</p></div>
+<div class="qa"><p class="q">有没有什么办法既有 RocksDB 的 write freshness，又支持 sequential large range read，还能 produce price chart out of box？</p><p class="a">这三样互相拉扯，没有一种结构同时拥有；所有号称都有的系统内部都是两层（行存/内存缓冲 + 不可变列存块），区别是内置还是你自己拼。三样都内置的：Timescale（你已经有）、QuestDB（专为行情造，DEDUP UPSERT KEYS + SAMPLE BY + MV）、Pinot（五种角色 + ZK）。ClickHouse 输在新鲜度（批级）和去重，赢在扫描程度和即席分析。</p></div>
+<div class="qa"><p class="q">Timescale 很贵，为啥？</p><p class="a">两部分。欠账：未压缩的字节 × 多个副本各算 IO，读副本是被未压缩扫描的慢逼出来的（一半 vCPU 在为运维欠账付息），每个服务独立付 HA，I/O Boost。结构：行存字节数 × 托管 Postgres 的每 vCPU 溢价 × HA 全价，Postgres 只能纵向扩。后来算出 compute 这一行（19 台实例）在 AWS 裸价就约 $9.7k/月、托管价估 $20–30k，压缩砍不动它——所以"修好的 Timescale"有地板，远高于 ClickHouse 整套。</p></div>
+<div class="qa"><p class="q">Timescale 里还存了非 cagg 的数据，long running query 有时候会拖累整个 cluster，就是 SQL 的锁。其实都不是 analytics，是因为 whales 需要 pull 几百万 transactions。</p><p class="a">三条路径：锁队列（长 SELECT 持 ACCESS SHARE，Timescale 后台的 compression/retention/cagg refresh 要 ACCESS EXCLUSIVE 排后面，再后面所有查询排 DDL 后面）、xmin 卡全库 vacuum、读副本 replication conflict。关键是触发者是 serving 查询（鲸鱼）不是分析，分不走。先问 API 拿几百万行干什么：展示 → 分页，和存储无关；计算 PnL → B1 让扫描便宜 100 倍（ClickHouse 按 (user, ts) 连续列存，几百 KB，100–300 ms 不阻塞任何人）或 B2 增量维护状态（Flink keyed state / 状态表）。倾向 B2 为主 B1 兜底。</p></div>
+<div class="qa"><p class="q">我倾向 ClickHouse，就是他不是实时的，我觉得 batch 需要 10 秒？</p><p class="a">不用，1 秒就够甚至 200 ms。限制是 part 数量不是最小间隔：1 秒 86,400 part/天稳态几十到两百；200 ms 也跑得动只是 active 多几倍。10 秒这个数多半是 150 个 part 就报错年代的经验。亚秒要么 async_insert 200–500 ms，要么最近几秒从 Redis 读（Helius 的内存层）。</p></div>
+<div class="qa"><p class="q">keeper 是个啥？我们需要 leader 呢？所以是我们实现个 Raft？</p><p class="a">Keeper 是只存元数据的小 Raft KV（ZooKeeper 的 C++ 重写），自带，三段配置启动，不是让你写。副本之间不需要 leader：part 不可变、block 编号全局唯一，两边同时 INSERT 只是各多一个 part；merge 输入相同结果字节级相同。唯一的 leader 在 Keeper 内部 Raft 自己选。Postgres 要 leader 是因为同一行可能被改要定序；ClickHouse 只有"出现"不需要定序者。写入全发一台最简单，A 永远最新、读也走 A、B 热备，副本延迟抖动顺便消失。</p></div>
+<div class="qa"><p class="q">我直接让每个 host 自己从 Kafka 里面读可以吗？另一个 agent 说不要 Keeper 更简单，到底哪个好？</p><p class="a">可以，Kafka 当复制日志是真实模式。但 Kafka 复制输入、Keeper 复制结果：所有非 Kafka 写（回填、DDL、mutation、REPLACE PARTITION、补节点）前者做 N 遍且分叉静默无人告诉你，后者做一次。两个 agent 分别对你的两个阶段都对：POC 单机什么都不要；上第二台那天加 Keeper，不要各自读 Kafka。"不要 Keeper"是第 1 天更简单，"要 Keeper"是第 100 天更简单。</p></div>
+<div class="qa"><p class="q">用 ClickHouse 自己的 keeper 是不是需要上 k8s？所以是单独一台 machine 跑 keeper？</p><p class="a">不需要 k8s，就是一个 systemd 进程，三台固定机器 EC2 + Terraform 是最省心形态。不是一台跑 Keeper，是三个 Keeper 进程：两个搭在 CH 机器上，第三票单独一台 t4g/m7g.medium——放 CH 机器上那台一挂丢两票。</p></div>
+<div class="qa"><p class="q">keeper 会影响性能吗？用了 keeper 是不是 single node 不用 hold whole dataset？</p><p class="a">读零影响（SELECT 不碰 Keeper，Keeper 挂了照常查）；写每批 3 次 Raft 往返约 5–10 ms，你每秒一批无感，每秒几千次小 INSERT 才是瓶颈。Keeper 不决定数据分布：副本每台全量，分片才让单台 hold 一部分——而你不需要分片，想减 NVMe 用 S3 分层。S3 读延迟确实大（几十到几百 ms 一次 GET × 几十次），3–6 TB 全放本地先不分层。</p></div>
+<div class="qa"><p class="q">那我如果用五台机器呢？Keeper 的意义到底在哪，我自己跑三个一模一样的副本不就行了？</p><p class="a">五台唯一合理拓扑 2 分片 × 2 副本 + Keeper，买到每台盘减半和写入余量，付出 Distributed 层、写入路由、以及 ClickHouse 没有自动 rebalance——分片数几乎不可逆。"三个一模一样"成立的前提是所有输入一模一样，而你的方案里 Spark 回填、每日重算、加 projection、改 TTL 都不走 Kafka，每件要做三遍。Keeper 的意义一句话：让"做一次"等于"三台都做了"。</p></div>
+<div class="qa"><p class="q">我 host 至少要 10 TB NVMe，用什么 instance type？你自己 web research 确认一下。</p><p class="a">查证后修正了我记的价格（偏低 20–30%，排名也变了）。≥10 TB 推到 15 TB 档（本地盘都 7.5 TB 一块）。i8ge.6xlarge（Graviton4，24 vCPU/192 GiB/2×7.5 TB，650k 读 IOPS）$2.85/h ≈ $2,080/月，比同形状 x86 的 i7ie.6xlarge 便宜 10%，比两代前 Graviton2 的 im4gn.8xlarge 还便宜且 IOPS 高 30%。ClickHouse 对 ARM 一等公民。两副本 + Keeper + S3 备份按需 ≈ $4.2k/月，Savings Plan 后 ≈ $2.9k。预算 $10k：必须 + staging（i8ge.3xlarge）+ 监控，剩 $4k 先不花，等增长曲线再选容量还是第三副本。</p></div>
+<div class="qa"><p class="q">Timescale 用的 EBS 吧？Helius 用 NVMe 还是 EBS？一个 NVMe 的 node 坏掉的可能性多大？</p><p class="a">Tiger Cloud 是 EBS（I/O Boost 就是 provisioned IOPS），差本地 NVMe 两个数量级，所以未压缩扫描不是慢一点而是打满 IOPS 池拖累所有人；EBS 换来的是持久性，这才是我们必须两副本 + S3 备份的根本原因。Helius 文章没明说，但 direct I/O + io_uring + 150 Gbit/s 持续吐 getBlock（EBS 任何实例卷带宽不到一半）+ 关 WAL 强调可重建，推断裸金属 + 本地 NVMe，高置信。单节点本地盘年丢失率约 2–5%（盘 AFR + 宿主机 retirement），两台同时坏千分之一每年；真正高频是人手滑 stop。三条纪律：两 AZ + Keeper 第三 AZ、IAM 禁 Stop/Terminate、重建流程 staging 演练过。</p></div>
+<div class="qa"><p class="q">ClickHouse 怎么处理 duplicate trade 或者 late trade？哪种更好，late reprocess vs weak dedupe？</p><p class="a">迟到免费（无"窗口已关闭"概念，迟到行进新 part，MV 算出老桶的局部值，merge 和 GROUP BY 自动修正），重复要你付钱。对流式 pipeline weak dedupe 更好：乱序持续发生、重复只在重启时成簇发生，让频繁的事免费、罕见的事一次性设计好——而去重恰好有完美幂等键。两边你都会保留凌晨重算，白天只需"大致对"。单独点名 retraction（分叉撤回）不是 late：跟 finalized 没有，跟 confirmed 极少交给重算，跟 processed 多一个量级。</p></div>
+<div class="qa"><p class="q">如果我用 trades 做 price chart 呢？不用 materialized view 吗？</p><p class="a">可以，最简单起点：热门币一天 20–40 ms、一年 1h K 线 1–3 秒挂掉；300 TPS 大部分是"最近一天"的话 32 核占 20%。好处：没有 candles 表、MV、T 接缝、Spark 回填 candles，回填 trades 就是回填图表。中间方案 aggregating projection：ClickHouse 在每个 part 里自动维护每分钟局部值，SQL 不变优化器自动选，没有第二张表没有接缝，代价和 trades 同生共死。排序：POC 直接扫 → 上线前加 projection → K 线要比原始数据活得久时才拆 MV。</p></div>
+
+<h3>存储：transaction ID 这一块</h3>
+<div class="qa"><p class="q">我感觉 transaction ID 是不是占空间很大的一部分？</p><p class="a">是，最大的一块。Solana 一行成交 ~240 B（base58 文本），signature 88 B 占 37%，加上它的 unique B-tree 索引项 ~100 B，表 + 索引约一半字节是 signature，而且压不动（随机）。ClickHouse 那边其他列压到 ~10 B/行，signature 还是 64–88 B，占压缩后 85–90%。处理：binary 存省 27%；(slot, tx_index) 代替身份；只存一份（图表表不存）；截断做去重键。</p></div>
+<div class="qa"><p class="q">把 transaction ID 换成 internal ID（number），内部全用 internal ID，专门存一个 mapping——能 cover 所有 use case 吗？</p><p class="a">分两类。交易 ID 不需要 mapping：<code>slot × 65536 + index</code> 天然整数、唯一、单调、consumer 不查表就能算、Spark 和实时算出同一个值、并行零协调。地址（mint/user）要全局字典（sequence 分配）：32 B → 4–8 B，每张表每个索引每次 GROUP BY 都受益，字典几 GB 本地缓存 99%+ 命中。坑：给 300 亿笔交易存 signature → id 的 mapping 约 4 TB，比要瘦身的 fact 表还大——没消灭 signature只是搬家。先回答"按 signature 搜要覆盖多久"。</p></div>
+<div class="qa"><p class="q">我不是问 wallet address，我是说 transaction ID 跟 block 和 index 绑定，理论上有序，转成 integer 做列存 Delta 压缩能省很大存储。</p><p class="a">完全成立，比我绕的那圈直接。按 (mint, ts) 排的表里同一币连续成交 slot 单调不减、块内 index 很小，Delta 要么几十要么 65536 的小倍数，3 字节以内，ZSTD 吃掉高位零。88 B → 2–3 B，30–40 倍，2.6 TB → 60–90 GB。顺带 minmax skip index 对它有效。唯一让步：推不回 signature，显示要另有来源。</p></div>
+<div class="qa"><p class="q">好吧，那其实没有节省任何东西：two-way lookup 要把 mapping 存两遍，又把省下来的打回去了。</p><p class="a">你算得对：一张 fact 表 + 双向全历史的前提下，Postgres 240 B vs 今天 188 B 更多，ClickHouse 140 B 只省 25%。节省真正来自三条：fact 表不止一份（每多一份省 88 B）；双向不对称——反向（显示）不需要独立表，只在显示用的那张表里当普通列存一份，图表表不存；正向（搜索）不用全历史或放最便宜的 KV。诚实修正：internal id 的价值不在节省 signature 本身的字节，在让它只出现一次、让关联和 GROUP BY 走 8 字节整数。只有一份 fact 且必须双向全历史就直接 binary 64 字节。</p></div>
+<div class="qa"><p class="q">区块链里通过 block number 和 index 找 transaction 的 API 多吗？</p><p class="a">EVM 一等公民（<code>eth_getTransactionByBlockNumberAndIndex</code> 标准 RPC）。Solana 不是 RPC 的 key 但是所有索引器的内部 key：Geyser 推的每笔自带 slot 和 index，Helius 新架构第一个索引就是 signature → (slot, position)，Dune/Flipside 表主键是 block_slot + index。还原走 <code>getBlock(slot, transactionDetails: "signatures")</code>。块内 index 稳定（ledger 里的顺序），所以能当身份；slot 有空洞，别假设连续。</p></div>
+<div class="qa"><p class="q">如果我在 Solana 把 internal index ↔ transaction ID 双向 mapping 都存一遍大概多大？</p><p class="a">最紧凑：正向 72 B/笔（64 sig + 8 id，都压不动），反向 64 B/笔（id 按序 Delta ≈ 0）。你的 280 亿笔 ≈ 3.8 TB，约今天 7 TB 的一半多；Solana 非投票 1,200 亿笔 ≈ 16 TB；含投票 5,000 亿 ≈ 68 TB。Postgres 翻倍。这张表的用途是逼出产品决定：按 signature 搜覆盖 30 天 ≈ 100 GB 放 Postgres 都行，全历史 2 TB 随机 key 只能放最便宜的 KV。</p></div>
+<div class="qa"><p class="q">"显示用那张 fact 表存一份"什么意思？我们的 use case 是展示 user 的 transactions，点进去跳 Solscan 的 URL 要 transaction ID。</p><p class="a">渲染这一页只有一条查询 <code>SELECT ..., signature FROM trades_by_wallet WHERE user_id = X ORDER BY ts DESC LIMIT 50</code>——signature 就是这张表的一个普通列，50 行回来自带，API 拼 URL 结束，没有第二跳。独立的 id → sig 表字节一样但多一张表多一跳多一处一致性。</p></div>
+<div class="qa"><p class="q">你说的话不 make sense：我的 goal 就是不想存 transaction ID 因为它占位置，结果你又说它就是个普通的列。</p><p class="a">我前面没把话说死：产品要显示 signature 就至少存一次，没有任何办法绕过——64 字节随机数和 (slot, index) 没有数学关系。internal id 省的是"存 N 次变 1 次"和"不要 B-tree"，省不到零。真正不存只有去别处拿：A 渲染时 RPC getBlock 现取（存储 0，每页最多 50 次 RPC 100–300 ms）；B 按 slot 排的 Parquet 放 S3（1.8 TB × $0.023 ≈ $40/月，几十到百 ms）；C 普通列（NVMe $150–300/月，零延迟）。三者差别是把 1.8 TB 放 NVMe、S3 还是别人的 RPC 节点上，不是存与不存。杠杆：图表表不存、显示表存 binary 不建 B-tree、要不要挪到 S3。</p></div>
+<div class="qa"><p class="q">那我们的 trades 其实就是 transaction 的双倍对吗？一个 transaction 有进出两个 trade？用 trade 存、key 是 wallet，有你说的 duplicate 数据问题吗？</p><p class="a">不是双倍也不是一比一。pump.fun/PumpSwap 一笔 swap 一行 trade（对手方是 curve/pool 不是另一个用户，进出是两列不是两行）；但一个 transaction 可含 N 个 swap（Jupiter 路由、机器人、bundle），trade 行数 ≈ 1.1–1.3 × 交易数。要修正前面的 tx_id：<code>trade_id = (slot, tx_index, instruction_index)</code>，三个整数拼一个 UInt64 还放得下。key = wallet 没有 Helius 的 fan-out 问题：一行 trade 恰好一个 user，存 1 次；唯一重复是跨访问路径（按 mint 一份、按 wallet 一份），固定 2 倍且是你选的，不是数据结构强加的 30 倍。</p></div>
+
+<h3>方法层</h3>
+<div class="qa"><p class="q">你一次讲的太多了，我前面还有几个问题。</p><p class="a">站 5 塞了四个引擎 + MV + 坑，超了。从那条起每条消息只讲一个点，"再把 5 讲一次"时压成一条主线三个推论。这一站后来成了问得最深的一站，正是因为拆开讲了。</p></div>
+<div class="qa"><p class="q">我问了另一个 agent 说是不要 Keeper 更简单，到底哪个好？</p><p class="a">两边都对因为"简单"指的不是同一件事（第 1 天 vs 第 100 天）。判断用你的具体情况量：会不会碰补机器（会，本地盘）、会不会改 schema（会，每周）、Keeper 本身负担（接近零）。让我改口的唯一情况是团队有"有状态组件必须托管"的纪律。</p></div>
+
+<h2 id="experience">5. 与我自己经验的连接</h2>
+<ul>
+  <li><b>生产 Timescale 的热点，现在有了机制解释。</b>9 月 review 发现的 trades_ts 未压缩、1d/12h cagg 刷 9–24 分钟、高频 UPDATE 表的回填打满 IO、WAL 副本追不上——分别对应站 1（未压缩扫描搬 10 倍字节 + EBS IOPS 池被打满）、站 8（cagg 是定时任务重扫窗口 + invalidation，MV 是 INSERT 时顺手算）、站 7（WAL 复制索引页 vs 复制压缩 part 的写放大差别）。那些曾经是"运维欠账"，现在能说出哪些是欠账、哪些是行存 + EBS + 共享锁模型的结构性成本。</li>
+  <li><b>Amazon 的 ClientToken 就是 insert_deduplication_token。</b>effectively-once = 不阻止重投、让重投没有效果；Kafka 的 idempotent producer 序号、AWS API 的幂等 key、ClickHouse 的 batch token 是同一个模式。我在 Amazon 做过的那些带 idempotency key 的 API 让这一层一听就懂，真正新的是"幂等键要确定性推导不要 sequence 分配"。</li>
+  <li><b>我自己在 Timescale 做的 union table 就是 lambda 架构。</b>hist 表 + cagg + UNION view = 批层 + 速层 + 合并读。ClickHouse 把两路写进同一张物理表让 merge 合并，Timescale 用 view 合并，读 300 TPS 用户感知不到差别。这一条让我把一个"ClickHouse 胜点"收回，是整个讨论里最诚实的一刻。</li>
+  <li><b>Kafka at-least-once 的 consumer 重启场景</b>是三层去重链路里每一个缝隙分析的素材：崩在哪、重放什么、谁认得出来。batch 边界按 offset 不按时间这条规则，直接来自"重启后重放的必须是同一批"。</li>
+  <li><b>DynamoDB 的热分区 3,000 RCU/s 上限</b>和 ClickHouse 的"没有 per-key 吞吐天花板"是同一个问题的两面：鲸鱼钱包的整个 ledger 在一个分区 vs 在一段连续的列存里。前者是容量上限调不动，后者只受 CPU/内存配额限制。</li>
+  <li><b>刚学完 6.5840 的 Raft，Keeper 一听就对上。</b>一个 Raft 复制的 KV 带 watch 和顺序节点；"我们实现个 Raft？"——不是，启动它。副本之间不需要 leader 的原因（不可变 + 唯一编号 → 没有要定序的写冲突）是 Raft 之后对"什么时候需要共识"的一次很好的反例练习。</li>
+  <li><b>Postgres 的 lock convoy、xmin、replication conflict</b>我在生产见过但没拆开过——这次把"一条慢查询拖垮集群"拆成三条独立路径，并且认出触发者是 serving 流量（鲸鱼）不是分析，这个区分决定了"隔离"是不是 ClickHouse 的真优势。</li>
+</ul>
+
+<h2 id="principles">6. 通用原则清单</h2>
+<ol>
+  <li class="principle"><b>一个存储引擎只能把一种访问形状做到极致。</b>行存和列存、点查和范围扫描是物理上的对立，不是设计品味；选引擎先写下你的查询形状。</li>
+  <li class="principle"><b>排序键是列存里唯一重要的 schema 决定。</b>它同时决定定位（稀疏索引只对前缀有效）和压缩率（相邻值像不像）；它是押注，押错了只能存第二份。</li>
+  <li class="principle"><b>压缩是速度特性不是存储特性。</b>把稀缺共享的磁盘带宽换成便宜可并行的 CPU 周期；codec 选择只看相邻两个值差在哪里。</li>
+  <li class="principle"><b>不可变 + rename 可见 = 最简单的原子性和崩溃恢复。</b>没有日志、没有 undo、没有半截数据；代价是不能原地改，所有更新变成追加 + 后台合并。</li>
+  <li class="principle"><b>"最终"语义必须在读时兜底。</b>你不控制后台何时收敛，所以任何依赖收敛的查询都要自己再做一遍合并，否则结果取决于后台心情。</li>
+  <li class="principle"><b>可合并的局部值是把工作从读挪到写的通用手法。</b>前提是结合律；成立时每批只算自己的，谁来合、分几次合都对，合并很便宜。</li>
+  <li class="principle"><b>去重的责任在写入方，前提是有确定性的幂等键。</b>没有 exactly-once delivery，有 effectively-once；有了幂等键它是工程问题不是研究问题。</li>
+  <li class="principle"><b>两个系统一起写时，先写事实的权威来源，再写辅助状态，最后 commit。</b>检查每个缝隙：只写成了第一个，世界必须是"对、只是没做完"，不能是"丢了一个东西"。</li>
+  <li class="principle"><b>追问"你的保证在什么条件下成立"直到条件窄到可接受，然后用对账兜尾部。</b>跨系统没有概率为零的方案；目标是漏掉需要多个独立坏事同时发生、漏掉之后损害有界且自愈。</li>
+  <li class="principle"><b>让频繁的事免费，让罕见的事一次性设计好。</b>流式 pipeline 里乱序持续发生、重复只在重启时发生，所以"迟到免费 + 去重前置"比"去重免费 + 迟到重算"便宜。</li>
+  <li class="principle"><b>复制结果和复制输入是两种不同的东西。</b>复制输入（各自读 Kafka）只在所有输入都一样时成立；任何旁路写入都让它分叉，且没人告诉你。</li>
+  <li class="principle"><b>不需要共识的地方别引入 leader。</b>没有"同一行被两边改"就没有要定序的冲突，唯一编号就够；共识留给元数据。</li>
+  <li class="principle"><b>多对多关系会把范围查询拆成一堆点查。</b>能一对一反范式化就是 2 倍存储换零点查；不能反范式化（一笔交易 30 个地址）就不该用列存。</li>
+  <li class="principle"><b>随机 ID 的字节总得有人存，内部 ID 只能让它只出现一次。</b>节省来自"N 份变 1 份、不要 B-tree、挪到便宜的地方"，不来自 ID 本身变短。</li>
+  <li class="principle"><b>"更简单"要问是第 1 天还是第 100 天。</b>少一个组件省今天的配置，多一个组件省以后每次补机器、每次 DDL、每次回填。</li>
+  <li class="principle"><b>提案先替对手说出他最强的论点。</b>Postgres 的 unique constraint 白送、Timescale 已经在用、修 Timescale 的地板在哪——不写出来评审会替你写，而且是在你被动的时候。</li>
+</ol>
+
+<h2 id="reading">7. 延伸阅读</h2>
+<ul>
+  <li><a href="https://www.helius.dev/blog/migrating-from-clickhouse-to-rocksdb">Helius — Solana Archival Migration: ClickHouse to RocksDB</a>：点查形状为什么和列存对不上；多对多逼出的第二跳；关 WAL 靠上游重建。</li>
+  <li><a href="https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree">ClickHouse docs — MergeTree</a>、<a href="https://clickhouse.com/docs/guides/developer/deduplicating-inserts-on-retries">Deduplicating inserts on retries</a>（token、窗口、MV 去重设置随版本变化）、<a href="https://clickhouse.com/docs/data-modeling/projections">Projections</a>、<a href="https://clickhouse.com/docs/engines/table-engines/mergetree-family/replication">Data replication</a>。</li>
+  <li><a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Pelkonen et al., "Gorilla: A Fast, Scalable, In-Memory Time Series Database", VLDB 2015</a>：DoubleDelta 和 XOR 浮点编码的来源，以及它们为什么对"大部分时间不变"的数据有效。</li>
+  <li><a href="https://presentations.clickhouse.com/2024-aws/">ClickHouse at AWS re:Invent 2024 — Graviton4 性能</a>；<a href="https://developer.arm.com/community/arm-community-blogs/b/servers-and-cloud-computing-blog/posts/improve-clickhouse-performance-up-to-26-by-using-aws-graviton3">Arm — ClickHouse on Graviton3 +26%</a>。</li>
+  <li><a href="https://docs.aws.amazon.com/ec2/latest/instancetypes/so.html">AWS — Storage optimized instance specifications</a>（instance store 表）；<a href="https://instances.vantage.sh/aws/ec2/i8ge.6xlarge">Vantage — i8ge.6xlarge</a>。</li>
+  <li><a href="https://docs.pinot.apache.org/">Apache Pinot docs</a>（upsert、star-tree、hybrid table）；<a href="https://docs.starrocks.io/">StarRocks docs</a>（Primary Key 表、shared-data）；<a href="https://questdb.io/docs/">QuestDB docs</a>（DEDUP UPSERT KEYS、SAMPLE BY、materialized views）。</li>
+  <li><a href="https://benchmark.clickhouse.com/">ClickBench</a>：单表扫描各引擎的横向比较，看相对位置不看绝对数。</li>
+  <li>本站上一篇 <a href="2026-10-02-zookeeper-wait-free-coordination.html">ZooKeeper：wait-free 协调服务</a>：Keeper 的前身，副本协调里"只把必须全局有序的东西放进共识"同一条原则。</li>
+</ul>
+
+</div>
+</body>
+</html>

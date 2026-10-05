@@ -45,6 +45,11 @@
   <p class="sub">读 tech blog / 拆解 topic 的深读笔记。每篇记录:文章总结、机制拆解、我的疑问与解惑、经验连接、可移植的通用原则。由 <code>/deep-dive</code> 工作流生成。</p>
 
   <!-- NOTES-LIST:START (新笔记加在最上面) -->
+  <a class="note" href="notes/2026-10-05-clickhouse-first-principles.html">
+    <div class="title">ClickHouse 从第一性原理 — 列存、MergeTree、去重的真相，以及一次替换 Timescale 的论证</div>
+    <div class="desc">三个倍数（列存 × 压缩 × SIMD）· granule / mark / part 为什么这么切 · ORDER BY 决定定位和压缩 · 每次 INSERT 一个 part、rename 即原子 · 家族引擎 = merge 时顺手做事、"最终"要读时兜底 · MV 是 INSERT 触发器没有记忆 · 去重三层 + 写入顺序 CH→Redis→commit · Keeper 为什么不需要 leader · Helius 点查 vs 我们范围扫描 · Timescale/Aurora/Flink+KV/QuestDB/StarRocks/Pinot 对比 · transaction ID 存储账 · i8ge 选型</div>
+    <div class="meta"><span class="tag">topic 拆解</span><span class="tag">存储引擎</span>2026-10-05 · 来源：topic 自构 + Helius 博客</div>
+  </a>
   <a class="note" href="notes/2026-10-02-zookeeper-wait-free-coordination.html">
     <div class="title">ZooKeeper：wait-free 协调服务 — 写 linearizable、读故意不、锁的安全在资源那边</div>
     <div class="desc">为什么不做锁服务 · znode/ephemeral/sequential/watch/version 各挡什么 · 写全序 + 单客户端 FIFO + 读本地 · ready znode · 锁配方与 herd effect · Zab 对 Raft · sync() 为什么不广播 · fuzzy snapshot = read skew · 读涨写降 · Raft 三档读 · fencing token = 资源层乐观锁 · pump.fun 的 Redis 锁缺哪条</div>
