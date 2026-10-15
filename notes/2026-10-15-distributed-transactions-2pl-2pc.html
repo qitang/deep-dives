@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分布式事务：2PL、2PC、隔离级别 — 6.5840 论文笔记</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>分布式事务：2PL、2PC、隔离级别 — 锁为什么攥到 COMMIT、YES 为什么交出了决定权</h1>
+  <div class="meta">
+    <span class="tag">6.5840</span><span class="tag">论文拆解</span>
+    深读日期：2026-10-07 → 2026-10-15（3 个 session）·
+    读物：<a href="https://ocw.mit.edu/courses/res-6-004-principles-of-computer-system-design-an-introduction-spring-2009/pages/open-textbook/">6.033 教材第 9 章</a>（Saltzer &amp; Kaashoek，§9.1.5–9.1.7、§9.5、§9.6.2–9.6.4）·
+    <a href="https://pdos.csail.mit.edu/6.824/notes/l-2pc.txt">6.5840 Lecture 11 notes</a> ·
+    <a href="https://pdos.csail.mit.edu/6.824/papers/chapter9-faq.txt">FAQ</a> ·
+    DDIA 第 7 章、第 9 章（<a href="https://ddia.vonng.com/">中译</a>）· MIT 6.5840 第 2 篇（ZooKeeper 之后，Spanner 之前）
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">读物总结</a></li>
+    <li><a href="#debate">核心争论：no dirty write 到底防什么</a></li>
+    <li><a href="#stations">七站机制拆解</a></li>
+    <li><a href="#qa">我的疑问与解惑（本笔记最有价值的部分）</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#recall">复述结果与回忆清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. 读物总结</h2>
+
+<p><b>背景。</b>课程前半段讲的是"多台机器装成一台可靠的机器"（Raft、ZooKeeper），从这篇起转向"多台机器各管一片数据，为了性能"。数据一分片，一个应用操作就可能跨多台机器：转账要改两个账户，建索引要同时写主表和索引表。两件事立刻冒出来：别的操作同时在跑怎么办（并发），做到一半有机器崩了怎么办（故障）。数据库在 1975 年（System R）就给了答案：<b>transaction</b>，程序员标出 BEGIN/END，系统自动提供好行为，概括成 ACID。这篇读物不是一篇论文，是 6.033 教材第 9 章 + 课程 notes + DDIA 的拼盘，讲 transaction 在单机和跨机器时各靠什么实现。</p>
+
+<p><b>三个名字三件事。</b>这是课程 notes 的主轴：distributed transaction = concurrency control + atomic commit。concurrency control 管 isolation（6.033 叫 before-or-after atomicity），工具是 <b>2PL</b>；atomic commit 管 atomicity（6.033 叫 all-or-nothing），工具是 <b>2PC</b>；再加上前几篇的 replication，工具是 <b>Raft</b>。三个独立的问题，三个独立的工具，一个真实的分布式数据库三个都要装（Spanner）。</p>
+
+<p><b>Isolation 有几档。</b>DDIA 第 7 章的阶梯：<b>read committed</b>（只读已提交的、只覆盖已提交的，挡 dirty read / dirty write）→ <b>snapshot isolation</b>（整个事务看开始那一刻的世界，挡 read skew，Postgres 叫 repeatable read，用 MVCC 实现，读不加锁）→ <b>serializable</b>（结果等于某一种串行顺序，挡所有异常，包括 lost update、write skew、phantom）。三档的写锁一模一样（exclusive，攥到 COMMIT），差别全在读那一列。serializable 的实现有三条路：真串行（VoltDB、Redis）、2PL（三十年来唯一的路）、SSI（Postgres 9.1+，乐观地跑、提交时查前提）。</p>
+
+<p><b>2PL。</b>6.033 §9.5 给了三种用锁的纪律，一种比一种并发高：全局一把锁；simple locking（事务开始时报出所有要碰的行一次锁齐，到 lock point 后放）；two-phase locking（用到哪行才锁哪行，但一把都不许提前放，COMMIT 或 ABORT 时一起放，锁数先单调涨后单调降，所以叫两阶段）。2PL 比 simple locking 并发高的场景是"事务要碰哪些行取决于它先读到什么"。不能早放的理由：别人会看到半成品，或者看到一个将被回滚的值。代价一：读也要加 shared lock，和 snapshot isolation 的"读写互不阻塞"是根本分叉。代价二：deadlock 是必然副作用，治法四种（锁排序、超时、找环、wound-wait），外加随机退避防 livelock。</p>
+
+<p><b>2PC。</b>6.033 §9.6.3 和课程 notes 的协议：coordinator（TC）给每个 participant 发 PREPARE；participant 把暂存值和"我投了 YES"<b>先写盘</b>再回 YES，从此不能单方面反悔；TC 收齐 YES 后<b>写盘 COMMIT</b>（这一行是不可撤销的那一刻），再发 COMMIT 消息；participant 转正、放锁、回 ACK。N 个 participant 共 3N 条消息。崩溃分析：participant 在 YES 之前崩 → 忘掉；YES 之后崩 → 恢复暂存、重拿锁、问 TC；COMMIT 之后崩 → 用 TID 去重再 ACK。TC 在写盘 COMMIT 之前崩 → 重启查无记录一律 ABORT（presumed abort）；之后崩 → 重发 COMMIT。</p>
+
+<p><b>阻塞问题的根。</b>participant 回了 YES 后 TC 失联，它既不能 ABORT（TC 可能已让别人 COMMIT）也不能 COMMIT（别人可能投了 NO 或 TC 还没写盘）。两个坏世界在 participant 眼里收到的消息序列完全相同，所以它手里的信息不够做任何决定，只能攥着锁等。超时不帮忙。3PC 多插一轮 PRE-COMMIT 想换掉阻塞，但需要完美故障检测器（分清"TC 死了"和"网络断了"），真实网络没有，所以没人用。两将军问题和 2PC 的关系：2PC 不解决它也不需要解决它，因为 2PC 只有一个决策者，而且不要求同时（eventually 不是 simultaneously）。</p>
+
+<p><b>两组对照。</b>2PC 要全体同意、Raft 只要多数派：Raft 里一台机器可替（别人有一样的），2PC 里一个 participant 不可替（y 只有 B 有）；Raft 为可用性而生，2PC 对可用性零贡献反而放大故障。serializable vs linearizable：都是"等于某个串行顺序"，差别是 linearizable 多了"该顺序和真实时间一致"并且对象是单个操作而不是事务；一个 snapshot isolation 的只读事务可以 serializable 但不 linearizable。</p>
+
+<p><b>落地。</b>把 TC 和 participant 各自用 Raft 复制起来再跑 2PC（Spanner 的结构）：解决了等的时长、单盘单机；没解决阻塞的结构、全体同意、更慢。Kafka 事务就是 2PC：transaction coordinator 写 PREPARE_COMMIT 到 <code>__transaction_state</code>，partition leader 是 participant，COMMIT marker 代替 COMMIT 消息，省掉了 PREPARE 轮（participant 永远 YES），没有写锁（追加不覆盖），阻塞转移到 read_committed 的 consumer 身上。outbox 模式不做 2PC，用本地事务 + 异步投递绕开它，放弃同时可见、恰好一次、跨系统 abort，换来无锁、无 in-doubt、故障隔离。</p>
+
+<h2 id="debate">2. 核心争论：no dirty write 到底防什么</h2>
+
+<p>这篇最长的一段卡在一个看起来最基础的地方：read committed 的两条规则里，"不读未提交的"（no dirty read）我一直懂，"不覆盖未提交的"（no dirty write）我好几年没搞清楚它防的是什么。这次跑了十几轮，我说了"你有点 hallucination 了"和"你先想清楚再讲"各一次，最后通了。推导链整理如下，包括讲的人走过的弯路，因为弯路本身说明了这个概念为什么难。</p>
+
+<blockquote>
+<p><b>1. 问题的形状。</b>T1 把 x 写成 1，没 COMMIT。T2 把 x 写成 2，COMMIT 了。允许这个发生，到底坏在哪？如果 T1 最后也 COMMIT，x = 2，等于串行 T1→T2，<b>什么都不坏</b>。这一点要先承认，不承认就一直对不上。</p>
+<p><b>2. 弯路一：undo log 的画面。</b>老式数据库 ABORT = 把 x 恢复成"我写之前的值"。T1 小本子记着"x 原来是 0"，ABORT 时盲目写回 0，把 T2 已提交的 2 抹掉了。这个理由我认可，但追问：<b>MVCC 下还成立吗？</b>不成立，MVCC 的 ABORT 没有写回动作。讲的人把 undo 的画面硬套到了 MVCC 上。</p>
+<p><b>3. 弯路二：拿 lost update 当例子。</b>两个事务都读 x=10 再各写回 11 和 15，T1 的 +1 丢了。我指出：这是 lost update，不是 dirty write，而且 read committed 明说不治 lost update。对。</p>
+<p><b>4. 弯路三：DDIA 的二手车例子。</b>Alice 和 Bob 各写两行（车卖给谁、发票开给谁），两组写穿插，结果车归 Bob 发票寄 Alice。例子对，但我说"很绕"，因为它展示的是后果不是机制。</p>
+<p><b>5. 通的版本（MVCC 下的机制）。</b>我自己的话：</p>
+<p style="padding-left:1rem;border-left:2px solid var(--muted)">no dirty write 就是 MVCC 的情况。每个 update 其实是一个 delete 和 insert。如果允许 dirty write，而且这个 write 是个 update，然后这个 update 之后又没 update 了，然后第一个 update 最后被 cancel 了，就会导致一个 delete 和 insert 都被 cancel，这样 MVCC 就有两个 version 是 visible 的。</p>
+<p>展开：T1（txid 13）写 x=1 → v0 标 <code>deleted_by=13</code>，挂 v1 <code>created_by=13</code>。T2（14）不等，只能把它看到的最新版本 v1 标 <code>deleted_by=14</code>，挂 v2。T1 ABORT → 13 的一切作废：对 v0 的删除不算数，v0 复活；v1 的创建不算数。T2 COMMIT → v2 可见。结果 <b>v0 和 v2 对同一个读者同时可见</b>，<code>SELECT x</code> 返回两行。这不是"存了多个版本"（MVCC 的常态，供不同快照的读者各取一个），是"链断成两条，没人负责 v0"。T2 写的时候不知道该不该连 v0 一起删，因为 T1 的结局还没出来。</p>
+<p><b>6. 根本理由（不依赖实现）。</b>绝大多数写是读改写（<code>x = x + 5</code>）。T2 的新值要从一个前驱算出来，T1 不出结局，前驱是 0 还是 1 就不知道，15 和 16 只能蒙一个，而且 T2 没有任何信息能让它选对，因为答案依赖一个未来事件。所以<b>第二个写者等第一个出结局</b>。undo log、MVCC 只是各家数据库用来"等"和"恢复"的机械，机械不是理由。</p>
+<p><b>7. 结论分三条。</b>纯盲写且都 COMMIT：不坏。纯盲写且 T1 ABORT：MVCC 出两个可见版本，坏；理论上能靠多标一个删除修掉，Postgres 没这么做。读改写：任何实现都必须等。写锁攥到 COMMIT 一条规则三类情况全治，所以三档隔离级别的写锁一模一样。</p>
+</blockquote>
+
+<p>教训（给讲的人）：我质疑实现细节时几乎都对；要把"机制"和"理由"分开讲，先承认无害的分支，再指出有害的分支。</p>
+
+<h2 id="stations">3. 七站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站 · 三个坏场景，三个名字</h3>
+<p>x = y = 10。T1 转账（x+1, y−1），T2 审计（读 x、读 y、打印）。合法结果只有 <code>11,9</code>（T1 先）和 <code>10,10</code>（T2 先）。</p>
+<pre><code>坏场景 ①（交错）                                       → isolation，工具 2PL
+T1:  r(x)=10  w(x)=11                       r(y)=10  w(y)=9  COMMIT
+T2:                    r(x)=11  r(y)=10  打印 11,10   ← 21 块，不是任何串行结果
+
+坏场景 ②（半截，x、y 在两台机器）                        → atomicity，工具 2PC
+x 机:  w(x)=11  COMMIT
+y 机:  ✗
+数据: x=11 y=10（永久）
+
+坏场景 ③（没了，x 那台彻底挂）                           → replication，工具 Raft</code></pre>
+<p><b>serializable 的定义</b>从场景 ① 长出来：并发跑完的结果等于<b>某一种</b>串行顺序的结果就算对，哪一种不管。这和 linearizable 的差别留到第 6 站。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站 · 隔离级别阶梯</h3>
+<table>
+<tr><th>级别</th><th>挡住</th><th>漏掉</th><th>实现</th></tr>
+<tr><td><b>read committed</b></td><td>dirty read、dirty write</td><td>read skew、lost update、write skew</td><td>写锁到 COMMIT；读不锁，走版本链拿旧的已提交值，每条语句一张快照</td></tr>
+<tr><td><b>snapshot isolation</b><br>（Postgres 叫 repeatable read）</td><td>+ read skew、（Postgres）lost update</td><td>write skew、phantom</td><td>写锁同上；读不锁，整个事务一张快照（MVCC：txid 比我大的或我开始时没提交的版本不看）</td></tr>
+<tr><td><b>serializable</b></td><td>全部</td><td>—</td><td>2PL（读也加 shared lock）/ SSI / 真串行</td></tr>
+</table>
+<p><b>read skew</b>：T2 的两次读跨在 T1 的提交线两边，读到 10 和 9，少 1 块。ZooKeeper 的 fuzzy snapshot 就是它，ZK 不修靠幂等重放收敛，数据库要修因为快照给人读。<b>lost update</b>：两个事务都读 42 各写 43，一个 +1 丢了；三种修法：原子写（<code>SET v = v + 1</code>）、<code>SELECT FOR UPDATE</code>、Postgres RR 自动检测"你改的版本被人盖过"abort 之。<b>write skew</b>：两个医生都读到 2 人在班，各改自己那行，都提交，0 人在班；两个事务写不同的行，lost update 检测抓不到，病根在读的前提被改。<b>phantom</b>：前提是"不存在这样的行"（会议室预订查到 0 行），写入凭空造出一行改变别人的查询结果，没有行可锁，要 predicate lock / index-range lock 或 SSI。</p>
+<p>repeatable read 的 "repeatable"：同一事务同一行读两遍一样，名字从它禁的异常 non-repeatable read 反过来起的。快照隔离给的比名字多（所有行冻在同一刻）。</p>
+</div>
+
+<div class="station">
+<h3>第 3 站 · 2PL</h3>
+<p>画法（这篇最后定下的）：严格一步一行，左边谁干什么，中间每个数据的"格子里是谁的名字"，右边数据当前值。</p>
+<p><b>两条规则。</b>A 拿：碰一行之前先在它的格子写名字，格子有人就等。B 放：写上的名字一个都不许提前擦，COMMIT 或 ABORT 时全部一起擦。</p>
+<pre><code>                      x 的格子    y 的格子
+开始                    空          空
+第 1 步 读 x            T1          空      ← 用到才拿（simple locking 这一行就是 T1 T1）
+第 2 步 写 x = 11       T1          空
+第 3 步 读 y            T1          T1      ← 现在才碰 y
+第 4 步 写 y = 9        T1          T1
+第 5 步 COMMIT          空          空      ← 一起擦</code></pre>
+<p>第 2 步之后 x=11 y=10 这个错的中间状态真实存在（6.033 §9.1.6：中间状态可以错，只要没人能看见）。T2 想看两半：先读 x → 排队到 T1 COMMIT；先读 y → T2 名字留在 y 格子，T1 第 3 步被拦 → deadlock → 杀一个重来。</p>
+<p><b>为什么不能早放</b>（规则 B）：T1 写完 x 擦掉名字，T2 读 x=1 写 z，COMMIT；T1 再写 y 或 ABORT。两个坏场景：T1 ABORT 则 z 抄了一个从没存在过的值；T1 不 ABORT 则 z = 1 + 0 = 1，不是任何串行结果（0 或 2）。病根：T1 擦名字时它的事没办完。</p>
+<p><b>锁的两种颜色。</b>读拿 shared（可以多个读者一起，等写者）；写拿 exclusive（等所有人）。读锁的用途：把"我读到的前提"钉住，别人在我提交前不能改它。用 2PL 跑医生例子：两人都拿 shared，都想升级 exclusive → deadlock → 杀一个 → 重跑读到 1 被拒。read committed / snapshot isolation 的读<b>根本不看格子</b>，这是和 2PL 的分界。</p>
+<p><b>Deadlock</b>：2PL 允许边跑边拿，就不能保证拿的顺序一致，闭环不可避免。四招：锁排序（预防，但要提前知道锁集）、超时、找环（Postgres/MySQL）、wound-wait（老杀新，Spanner）。serializable 下 deadlock 比 read committed 频繁得多，因为读也留名，能互相拦的动作多了。两个事务都"读 x 再写 x"，一行数据就能死锁（升级锁）。livelock 用随机指数退避。</p>
+<p><b>官方题</b>（2PL 比 simple locking 性能好的场景）：T1 先碰 x 再碰 y，T2 只碰 y，T2 在 T1 刚锁 x 时到达；simple locking 下 T2 等，2PL 下 T2 不等。一般形式：事务要碰哪些行取决于它先读到什么。</p>
+</div>
+
+<div class="station">
+<h3>第 4 站 · 2PC 协议与逐步崩溃</h3>
+<pre><code>步骤                             TC                   A（管 x）              B（管 y）
+1  TC 分配 TID = 7
+2  TC 发 put 给 A、B                                  拿 x 锁，暂存 11         拿 y 锁，暂存 9
+3  应用说 END
+4  TC → A、B：PREPARE(7)
+5                                                    写盘 PREPARED，回 YES    写盘 PREPARED，回 YES
+6  TC 收齐 YES，写盘 "7 COMMIT"   ← 结局定了，不可撤销
+7  TC → A、B：COMMIT(7)
+8                                                    11 转正，放锁，回 ACK    9 转正，放锁，回 ACK
+9  TC 收齐 ACK，忘掉 7</code></pre>
+<p>第 2 行拿的锁到第 8 行才放，跨两轮网络往返和三次写盘，这是 2PC 慢和 deadlock 范围扩大的原因。</p>
+<p><b>第 5 行写盘的意义</b>：没写盘就回 YES，B 崩了重启，暂存的 9 没了，TC 发 COMMIT 它做不了，A 已经加了钱，x=11 y=10 永久。写盘让 YES 的承诺崩溃后还能兑现。</p>
+<table>
+<tr><th>B 崩在</th><th>磁盘上有什么</th><th>重启后</th><th>安全的理由</th></tr>
+<tr><td>第 5 行之前</td><td>没有 7</td><td>忘掉；之后 PREPARE 来了回 NO</td><td>没回过 YES，TC 不可能 COMMIT</td></tr>
+<tr><td>第 5 行之后、第 7 行之前</td><td>PREPARED, y=9</td><td>恢复暂存、<b>重拿 y 锁</b>、问 TC 结局</td><td>YES 可能已送达，A 可能已提交</td></tr>
+<tr><td>第 8 行之后</td><td>y=9 已转正</td><td>收到重复 COMMIT 再 ACK</td><td>TID + 状态记录造出的至多一次</td></tr>
+</table>
+<table>
+<tr><th>TC 崩在</th><th>重启后</th><th>安全的理由</th></tr>
+<tr><td>第 6 行之前</td><td>查无 COMMIT 记录 → ABORT（presumed abort）</td><td>没写盘就不可能发过 COMMIT，A、B 谁都没提交</td></tr>
+<tr><td>第 6 行之后</td><td>重发 COMMIT</td><td>决定在磁盘上，照着执行</td></tr>
+</table>
+<p>谁 trigger 那个 ABORT：TC 扫日志找"有开始没 COMMIT"的；或 B 作为 persistent sender 追问，TC 查无记录回 ABORT。B 回完 ACK 可以彻底忘掉 7，之后迟到的 COMMIT(7) 查无此事务 = 已做完，直接 ACK；成立的前提是 PREPARED 永远写在 YES 之前。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站（心脏站）· 阻塞问题的根</h3>
+<p>B 写盘 PREPARED、回了 YES，TC 不回话。两个选择，各有一个让它出错的世界：</p>
+<pre><code>选择 1：B 自己 ABORT 的坏世界            选择 2：B 自己 COMMIT 的坏世界
+A：YES                                   A：NO（x 账户被冻结）
+B：YES                                   B：YES
+TC：写盘 COMMIT，发给 A，发给 B 前崩 ✗     TC：写盘 ABORT，发给 A，发给 B 前崩 ✗
+A：提交                                  A：回滚
+B：ABORT → x=11 y=10                     B：COMMIT → x=10 y=9</code></pre>
+<p><b>从 B 的视角两个世界收到的消息序列完全相同</b>："我投了 YES，然后没消息了"。不管选哪边都有一个世界让它错。超时不帮忙，等再久信息也不多一个比特。唯一不出错的动作是攥着锁等。<b>投出 YES 的那一刻 B 把决定权交出去了</b>，换来"TC 说 COMMIT 我一定能做到"这个承诺。</p>
+<p><b>B 去问 A</b>：A 说"我投 NO"→ ABORT 行；A 说"我已 COMMIT"→ COMMIT 行；A 说"我也 YES 也在等"→ 还是两个世界。<b>3PC</b> 在 YES 和 COMMIT 之间插一轮 PRE-COMMIT，使"收到 PRE-COMMIT ⇒ 所有人 YES"、"有人 COMMIT ⇒ 所有人收到 PRE-COMMIT"，TC 崩了 participant 互问就能定。但它建立在"TC 真的死了"上，而判死只有超时，分不清 TC 崩了和网络断了：{TC, A} | {B} 分区，B 没收到 PRE-COMMIT 认定 TC 死 → ABORT，TC 那边收到 A 的 ACK → COMMIT。需要完美故障检测器，真实网络没有。<b>两将军</b>：必须同时进攻、信使会丢，有限条消息做不到（最后一条可能丢所以多余，归纳到零）。2PC 不碰它：单决策者（TC 不会跟自己打架）+ 无同时性要求（eventually 不是 simultaneously）。不是拜占庭将军（那是人撒谎，PBFT 第 16 篇）。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站 · 两组对照</h3>
+<table>
+<tr><th></th><th>Raft 里的一台 server</th><th>2PC 里的一个 participant</th></tr>
+<tr><td>它干的活</td><td>和其他人一模一样</td><td>和其他人不一样（A 管 x，B 管 y）</td></tr>
+<tr><td>少了它</td><td>别人有一样的，可替</td><td>没人有 y，不可替</td></tr>
+<tr><td>需要几个同意</td><td>多数派（多数派里必有最新的，两个多数派必相交）</td><td>全体</td></tr>
+<tr><td>误判对方死了</td><td>多一轮选举，不出错</td><td>一边有一边没有</td></tr>
+<tr><td>对可用性</td><td>为它而生，5 挂 2 照常</td><td>零贡献，3 挂 1 全停，放大故障</td></tr>
+</table>
+<table>
+<tr><th></th><th>serializable</th><th>linearizable</th></tr>
+<tr><td>对象</td><td>事务（多操作、多行）</td><td>单个操作、单个 key</td></tr>
+<tr><td>要求</td><td>存在某个串行顺序结果一样</td><td>同左，<b>且该顺序和真实时间一致</b></td></tr>
+<tr><td>出处</td><td>数据库圈</td><td>分布式圈（Herlihy &amp; Wing 1990，原本讲单机多线程共享对象）</td></tr>
+</table>
+<p>两条独立的轴（我的总结："一个是 transaction，一个是 consistency"）。三种组合：snapshot isolation 的只读事务（S 不 L）；Raft 上的 KV（L 不 S）；Spanner 的 external consistency = strict serializability（都有）。<b>S 不 L 的单机例子</b>：T2 BEGIN(repeatable read) → T1 UPDATE x=11 COMMIT → T2 SELECT x 读到 10。T2 开始得早、读发生得晚；serializable 认（T2 排前面说得通），linearizable 不认（墙上钟 T1 在前）。多副本版：T1 在 primary 提交，T2 在落后的 replica 读到 10。两个版本共同点：这次读在真实时间上晚于 T1 的提交却读到旧值。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站 · 落地</h3>
+<p><b>TC 用 Raft 复制</b>：第 4 站第 6 行"写盘 COMMIT"变成"复制到多数派"。解决了：等的时间从修机器缩到选 leader、单盘坏不丢、单机崩不停。没解决：阻塞的结构（B 的信息不足是 cp1 的结论，复制不给它多一个比特）、全体同意（一个 group 多数派不在就停）、更慢（三次写盘各变一轮复制）。口算：TC leader 在 COMMIT 复制到多数派前崩，新 leader log 里没有 → ABORT，= presumed abort。这就是 Spanner 的结构。</p>
+<p><b>Kafka 事务 = 2PC</b>：</p>
+<table>
+<tr><th>2PC</th><th>Kafka</th></tr>
+<tr><td>TC</td><td>transaction coordinator（某 broker），状态在 <code>__transaction_state</code>（多副本）</td></tr>
+<tr><td>participant</td><td>每个 partition 的 leader</td></tr>
+<tr><td>暂存值</td><td>消息直接追加进 log，带 PID+epoch</td></tr>
+<tr><td>PREPARE / YES</td><td>省掉：participant 永远 YES（消息已在 log 里，没有说 NO 的理由）</td></tr>
+<tr><td>TC 写盘 COMMIT</td><td>写 PREPARE_COMMIT 到 <code>__transaction_state</code> 复制到多数派</td></tr>
+<tr><td>COMMIT 消息</td><td>WriteTxnMarker，leader 在 log 末尾追加 COMMIT marker</td></tr>
+<tr><td>锁</td><td><b>没有</b>。写是追加不覆盖，写者互等的理由不存在</td></tr>
+<tr><td>阻塞</td><td>转移到读者：read_committed consumer 停在第一个未定消息前（LSO 不前进），后面无关的消息也出不来；read_uncommitted（默认）不等</td></tr>
+</table>
+<p><b>outbox</b>：trade 行和 outbox 行在同一个本地事务里 COMMIT（单机 all-or-nothing，不需要 2PC），另一进程扫 outbox 发 Kafka，发成功删行。放弃：两边同时可见、恰好一次（至少一次，consumer 要幂等）、跨系统 abort（Postgres 一旦 COMMIT，Kafka 必然最终发出）。换来：无跨系统锁、无 in-doubt、无 coordinator、故障隔离（Kafka 挂一天 Postgres 照常）。绕不开真 2PC 的条件：第二个系统有权说 NO（扣款可能被拒）且业务不能忍补偿窗口；能忍就 saga，不能忍就 2PC 或放进同一个数据库。</p>
+</div>
+
+<h2 id="qa">4. 我的疑问与解惑</h2>
+
+<h3>第 1–2 站</h3>
+<div class="qa"><p class="q">2PL 你会讲到吗？这个我没了解过。</p><p class="a">第 3 站整站。先给对应：就是 mutex，但由数据库自动加，外加两条规则：用到哪行锁哪行、拿到的全攥到 COMMIT 一起放。口算：T1 持 x 锁时 T2 来读 x → 阻塞到 T1 COMMIT，打印 11,9。</p></div>
+<div class="qa"><p class="q">repeatable read 里面这个 repeatable 我一直不懂啥意思。</p><p class="a">同一个事务里把同一行读两遍，两次一样。名字从它禁的异常 non-repeatable read 反过来起的（SQL 标准的套路：每一级以它禁掉的异常命名）。快照隔离天然满足它，而且给的比名字多：不只单行，所有行都停在同一时刻。</p></div>
+<div class="qa"><p class="q">【口算错】read committed 下 T2 两次 r(y) 读到 10 和 9；repeatable read 呢？我答还是 10 和 9。</p><p class="a">错，是 10 和 10。错误前提是"提交了就可见"，那是 read committed 的规则。快照隔离下可见不可见在 T2 开始那一刻定死：y=9 是 txid 13 创建的，13 &gt; 12 永远成立，T1 什么时候提交都不改变这个比较。read committed 每条语句一张快照，snapshot isolation 整个事务一张。</p></div>
+<div class="qa"><p class="q">等等，我们是不是跳过什么了？怎么讲起 transaction 了，我以为讲 2PC 和 2PL。</p><p class="a">没跳。标题三样东西：2PL 是手段、isolation 是它要买的东西；2PC 是手段、atomicity 是它要买的东西。第 2 站讲 isolation 本身有几档、各漏什么，第 3 站讲 2PL 时才知道它为什么值得付"读写互相阻塞"的代价。教训给讲的人：每幕开头重申在路线图哪里。</p></div>
+
+<h3>第 3 站</h3>
+<div class="qa"><p class="q">你讲的太粗了完全不懂。"边跑边拿、结束一起放"啥意思？<code>r(x)[x] w(x)=11 …</code> 又是啥？</p><p class="a">压缩写法没定义就用了。改成表格：每步一行，右边每个数据一列"格子里是谁的名字"。边跑边拿 = x 的名字第 1 步才写、y 的名字第 3 步才写，用到了才拿；结束一起放 = 第 2 步写完 x 名字不擦，攥到第 5 步和 y 一起擦。</p></div>
+<div class="qa"><p class="q">那不对啊，第 3 步之前 x 是 11、y 是 10。</p><p class="a">对，这个错的中间状态真实存在。6.033 §9.1.6：中间状态可以错，只要没人能看见。T2 想看两半：先读 x → 格子是 T1，排队到 COMMIT；先读 y → T2 名字留在 y 格子，T1 第 3 步被拦，deadlock，杀一个重来。读要上锁就是为了留名拦人；快照隔离读不留名，所以走另一条路（旧快照）。</p></div>
+<div class="qa"><p class="q">规则 B 是个啥？</p><p class="a">两轮前定义的忘了。A 拿：碰前写名、占着就等。B 放：不提前擦、COMMIT/ABORT 一起擦。教训：每幕开头把本幕要用的规则重贴一遍。</p></div>
+<div class="qa"><p class="q">清楚了，但是在分布式系统里面你怎么"同时" release lock？</p><p class="a">不需要同时。规则 B 真正要求的是"结局定下来之前一个都不擦"，先后擦无所谓。x 在 A、y 在 B，coordinator 落盘 COMMIT 后 A 10:00:00 擦、B 10:00:05 擦，中间 T2 读 x=1 等 y → z=2 合法，因为它看到的 x=1 是已经定了的。6.033 §9.6.3：eventually 不是 simultaneously。这是第 4 站的事。</p></div>
+<div class="qa"><p class="q">【口算出歪了】"B 在决定前擦 y，T2 读到几"，我答 1 和 0、z=1。</p><p class="a">我错在没看第 2 行 y 已经写成 1；讲的人错在题目没说 T1 会 ABORT，不 ABORT 那条路居然合法。重做：B 提前擦 → T2 读到 y=1 → T1 ABORT 回滚 → T2 算出 z=1，正确只能是 0。教训给讲的人：口算题自己先走一遍表确认只有一条路。</p></div>
+<div class="qa"><p class="q">DDIA 说 serializable 下 deadlock 比 read committed 频繁得多，这是啥意思？"比读已提交下"是啥？</p><p class="a">比两个隔离级别。read committed 只有写留名，两个事务要互相拦得都写对方要写的行；2PL 读也留名，读了对方要写的行就能互相拦。读的行远多于写的行，机会多好几倍。</p></div>
+<div class="qa"><p class="q">首先 in general 2PL 的读是 wait for lock release 吗？</p><p class="a">只在一种情况下等：格子里有写锁。读拿 shared lock，和别的读者不冲突。课程 notes 简化成所有锁都 exclusive，真实数据库是 shared/exclusive 两种（6.033 §9.5.4 lock compatibility mode）。</p></div>
+<div class="qa"><p class="q">读为啥要加锁呢？防止写？</p><p class="a">对。读锁 = 把我读到的前提钉住，直到我基于它做的决定提交。医生例子用 2PL 跑：两人都拿 shared 读到 2，都想升级 exclusive 改自己那行，deadlock，杀一个，重跑读到 1 被拒。没有读锁，T1 的前提被悄悄改掉自己不知道，就是 write skew。</p></div>
+<div class="qa"><p class="q">业界常用的名词你不需要翻译，这样反而让我更 confused，比如 serializable 翻译成"可串行化级别"，read committed 翻译成"读已提交"。</p><p class="a">收到，以后一律英文：read committed、snapshot isolation / repeatable read、serializable、dirty read、lost update、write skew、phantom、read skew、lock point、shared/exclusive lock。已写进 /mit skill 规则。</p></div>
+<div class="qa"><p class="q">read committed 根本就不用锁吧？</p><p class="a">一半对。read 不拿锁；write 拿 exclusive lock 到 COMMIT，挡 dirty write。三档的写锁一模一样，差别全在读那一列。read committed 下也会 deadlock（两个事务都写 x 和 y 顺序相反），只读事务永远不参与。</p></div>
+<div class="qa"><p class="q">有点晕，帮我总结 read committed vs snapshot isolation，它们的 read/write 锁都是怎么工作的？</p><p class="a">锁一模一样：写拿 exclusive 到 COMMIT，读不写名字不等任何人。差别只在读返回哪个版本：read committed 返回此刻最新已提交版本（每条语句一张快照），snapshot isolation 返回事务开始时已提交的版本（整个事务一张）。同一套 MVCC，差别只是快照什么时候拍。</p></div>
+<div class="qa"><p class="q">"不写名字、不等任何人、立刻返回"让我更困惑了，你刚刚说了 read 的时候如果 writer lock 了 read 就要等。</p><p class="a">两句话属于两个世界没标清：前者是 read committed / snapshot isolation，后者是 2PL / serializable。同一场景三档对照：T1 持 x 写锁写 11 没提交，T2 来读：RC → 不看格子返回 10；SI → 不看格子返回 10；2PL → 看格子有 T1，等到 COMMIT 读 11。前两档的格子只给写者之间互相用。</p></div>
+<div class="qa"><p class="q">"T1 写了 x 还没 COMMIT，T2 也要写 x，T2 必须等，不然 T1 一 ABORT 回滚把 T2 的写也抹了"，这是为啥？为啥 rollback 会把 T2 的 value 弄没？</p><p class="a">（核心争论的起点）undo log 的世界：ABORT = 按小本子"x 原来是 10"盲目写回，不知道中间 T2 来过。见第 2 节推导链第 2 步，这个解释我接受但追问了 MVCC。</p></div>
+<div class="qa"><p class="q">不是有个 MVCC 吗？</p><p class="a">有，MVCC 下 ABORT 不写回，那张 undo 表是老式数据库的画面，硬套了。MVCC 下第二个写者照样等，理由换成"版本链不能分叉"：挂 v2 后面则 T1 ABORT 后 v0 复活 + v2 可见两个版本；挂 v0 后面则 T1 COMMIT 后 v1、v2 都是 10 之后的下一个。Postgres 文档："waits for the first updating transaction to commit or roll back"。</p></div>
+<div class="qa"><p class="q">v3 的父亲是个被 reverted 的版本，有什么关系？</p><p class="a">具体后果是 x 同时有两个可见版本。可见性规则：创建者已提交且删除者未提交（没人删或删它的人 ABORT 了）。T1 ABORT → v0 的 deleted_by=13 不算数 → v0 可见；v2 由 14 创建已提交 → 可见。<code>SELECT x</code> 返回 10 和 20 两行。T2 写时只删了 v2 没删 v0，因为它不知道 T1 将来会不会 ABORT。</p></div>
+<div class="qa"><p class="q">不懂。（第四轮）</p><p class="a">讲的人按止损规则先放下，留一句最简单的："一行数据任何时刻只能有一个最新值，两个没提交的写同时挂在一行上就有两个候选，没人能说出哪个是最新的，所以后来的写者等前一个出结局。"我不接受，要求讲清楚。</p></div>
+<div class="qa"><p class="q">这个地方我 confuse 很久了，你必须给我讲清楚。</p><p class="a">换起点：数据库里几乎没有盲写，<code>x = x + 5</code> 是读改写。T2 要知道 x 现在是几，答案依赖 T1 的结局（COMMIT 则 11，ABORT 则 10），结局还没出来，T2 写 15 或 16 都有一半概率错，而且没有任何信息能让它选对。唯一正确的做法是等。这和 MVCC、undo 都没关系，是算术层面的。</p></div>
+<div class="qa"><p class="q">我的 read committed 都是明白的，我就是一直不懂 write committed 的意义。你的例子里 T1、T2 读的都是 last committed x=10，T1 update 成 11，T2 update 成 15，这有啥问题吗？</p><p class="a">最后 x = 15，应该是 16，T1 的 +1 消失了没人报错，这是 lost update。但我接着指出这不是 dirty write。</p></div>
+<div class="qa"><p class="q">你这个例子是 lost update 吧，不是 dirty write。</p><p class="a">对。两个病混着讲了。dirty write 的定义：T2 覆盖了 T1 还没 COMMIT 的写。用 DDIA 两行车例子重讲：两组盲写穿插，车归 Bob 发票寄 Alice，不是任何串行结果。</p></div>
+<div class="qa"><p class="q">这个地方很绕，我建议你自己先想想清楚再解释给我。</p><p class="a">讲的人停下来理了一遍：三个不同的病（lost update、rollback 覆盖、dirty write 本体）被当成一个讲了。只讲第三个，剥到最薄：两个事务各写两个格子，不加锁穿插出 <code>B A</code>，加锁出 <code>B B</code>。写锁攥到 COMMIT 保证一个事务的所有写之间不会插进别人的写。</p></div>
+<div class="qa"><p class="q">你说的这个是 snapshot isolation 吧？</p><p class="a">不是。写锁 / no dirty write 从 read committed 就有，snapshot isolation 原封不动继承，只多了读的规则。DDIA 原话："与读已提交类似，快照隔离的实现通常使用写锁来防止脏写……但是读取则不需要加锁。"往上爬一档，写那一列从来不动。</p></div>
+<div class="qa"><p class="q">还是不懂。你的例子我理解，但是就两个 write 同一个 variable：T1 write to 1 not committed，T2 wrote to 2 and committed，what is the problem if we allow this? Doesn't seem it will break anything.</p><p class="a">你对：T1 最后 COMMIT 的话什么都不坏，x=2 等于串行 T1→T2。坏在 T1 ABORT 的分支。讲的人先用 undo 画面讲"恢复成 0 抹掉 T2 的 2"，我又指出 MVCC 下不成立。</p></div>
+<div class="qa"><p class="q">你有点 hallucination 了。"T1 只知道我写之前 x 是 0，不知道中间 T2 来过"是老数据库的实现原理，我同意。但在 MVCC 下 is this still a valid reason?</p><p class="a">不是。MVCC 的 ABORT 没有写回动作。按 MVCC 重走：T1 写 → v0 deleted_by=T1，v1 created_by=T1；T2 不等 → v1 deleted_by=T2，v2 created_by=T2；T2 COMMIT；T1 ABORT → v0 复活、v1 不可见、v2 可见 → <b>x 同时有 0 和 2 两个可见版本</b>。不是值被抹掉，是 T1 作废把它对 v0 的删除一起作废。根本理由还是读改写（第 2 节第 6 步）。三条结论见第 2 节第 7 步。</p></div>
+<div class="qa"><p class="q">MVCC 不就是保持多个 row version 吗？</p><p class="a">对，但每个读者在它的快照里一行只能看见一个版本。正常版本链是直线，每个旧版本被下一个的创建者删掉，任何读者沿链看恰好一个满足规则。出事的是链断成两条、没人删 v0，v0 和 v2 对同一读者都满足规则。多版本共存于存储是常态，多版本对同一读者同时可见是坏状态。——这里懂了。我自己的话见第 2 节第 5 步。</p></div>
+<div class="qa"><p class="q">这个 write committed 我好几年都搞不清楚，现在终于懂了，应该记在哪个地方？</p><p class="a">progress.md 问题记录、这篇笔记第 2 节、以及我自己写的那段话原文放进来。持久 memory 要说"记住"才写。</p></div>
+
+<h3>第 4 站</h3>
+<div class="qa"><p class="q">题外话，2PC 的 read 加锁吗？（其实想问 2PL）</p><p class="a">2PC 不管锁，只管一起 commit/abort；锁是 participant 自己的隔离级别决定的，2PC 只要求攥到 phase 2 结束。2PL：读 shared、写 exclusive，都攥到 COMMIT；RC/SI 读不锁。Spanner 读写事务 2PL+2PC、只读事务完全不加锁。</p></div>
+<div class="qa"><p class="q">"拿幕 1 那张 9 行表"这个太上面了，我根本找不到。</p><p class="a">引用了看不见的东西。以后每次用到就重贴，哪怕两轮前刚贴过。我要求记进 memory，已记（所有 session 生效）。</p></div>
+<div class="qa"><p class="q">我听不懂。（三种崩法一起列表）</p><p class="a">收成一个故事：先演"没写盘就回 YES → B 崩 → 重启后 TC 发 COMMIT 它做不了 → x=11 y=10 永久"，再演加写盘后重启恢复暂存、重拿锁、等 TC。一句话：写盘让 YES 的承诺崩溃后还能兑现。教训给讲的人：一幕只演一个故障，先演坏的再演修的。</p></div>
+<div class="qa"><p class="q">"重复的 COMMIT 只需要再应一声，靠 TID 7 认出这个我做过"，这是 assume 这个操作是 idempotent？</p><p class="a">不是假设，是造出来的。<code>y = y − 1</code> 不幂等，幂等靠 B 查账：7 在 PREPARED → 执行一次记下"已做"；已做过 → 只回 ACK。= Raft §8 去重、Kafka idempotent producer 的 sequence number。B 回完 ACK 可以忘掉 7，之后迟到的 COMMIT(7) 查无此事务 = 已做完（前提：PREPARED 永远写在 YES 之前，两条规则互相咬合）。</p></div>
+<div class="qa"><p class="q">TC 收到两个 YES 之后 crash 咋办？</p><p class="a">以第 6 行写盘为界：之前崩 → 重启当 ABORT；之后崩 → 重发 COMMIT。TC 这边和 participant 一样，写盘那一刻就是不可撤销的那一刻。A、B 在 PREPARED 攥锁等，分不清两种情况 → 第 5 站。</p></div>
+<div class="qa"><p class="q">"TC 重启翻磁盘 7 没有 COMMIT 记录 → 当作 ABORT"，什么 trigger 这个 abort 呢？</p><p class="a">两条路：TC 发 PREPARE 前写过"7 开始了"（6.033 的 outcome record）则重启扫日志主动发 ABORT；没写过则 B 作为 persistent sender 定期追问，TC 查无记录回 ABORT（presumed abort）。反问"为什么敢对不认识的 7 说 ABORT"，我答：没本地 COMMIT 就不可能发过 COMMIT，A 不可能提交。对。</p></div>
+
+<h3>第 5–6 站</h3>
+<div class="qa"><p class="q">3PC 大概了解一下就好了？主要是了解 2PC？</p><p class="a">对。3PC 一句话：多一轮消息换不阻塞，代价是要能完美判断 TC 死没死，真实网络做不到，没人用。5 道 checkpoint 里 3PC 一次都没出现。</p></div>
+<div class="qa"><p class="q">你说的是拜占庭将军问题吗？</p><p class="a">不是。两将军：信道不可靠（消息会丢）、人诚实，结论是有限条消息无法确定同时进攻，和 2PC 对照。拜占庭将军（Lamport 1982）：人撒谎，叛徒少于 1/3 可达成一致，PBFT 第 16 篇的祖先。本课前面所有论文都假设 crash-only。</p></div>
+<div class="qa"><p class="q">【我的总结】serializable 和 linearizable 完全不同的概念吧，一个是 transaction 一个是 consistency。</p><p class="a">对，两条独立的轴，不是一个东西的强弱版。关系只在定义形状（都是"等于某个串行顺序"，linearizable 多了真实时间 + 单操作）。FAQ 把它们放一起问是因为学生常把 serializable 当成"事务版的 linearizable"。</p></div>
+
+<h3>第 7 站</h3>
+<div class="qa"><p class="q">"阻塞在哪里？Kafka 没锁但等价物在：consumer 读 P2 会停在 m2 那里（LSO 不前进）"，这里不懂。</p><p class="a">画 P2 的 log：<code>[a][b][m2][c][d][e]</code>，m2 属于事务 7 还没 marker。read_committed consumer 只能交出已 COMMIT 的，不能跳过 m2 先交 c（partition 内按 offset 顺序交付），所以停在 m2 前，c d e 跟着出不来，哪怕它们的事务早完成了。两边都是"一个结局未定的事务拦住无关的人"：数据库用锁拦写者，Kafka 用顺序交付拦读者。</p></div>
+<div class="qa"><p class="q">【我的总结】所以 Kafka 这里有点不一样，就是 committed write 其实不会阻塞，但是 read committed 会。</p><p class="a">对。Kafka 的写是追加不是覆盖，两个 producer 往 P2 写各占各的 offset，第 3 站"写者互等"的理由不存在，所以没有写锁。read_committed 等，read_uncommitted（默认）不等。</p></div>
+<div class="qa"><p class="q">outbox 我熟，经常用。</p><p class="a">那正好。表格见第 7 站卡片。绕不开 2PC 的条件：第二个系统有权说 NO 且业务不能忍补偿窗口。</p></div>
+
+<h3>复述 checkpoint 4(a) 的质疑链（2026-10-15，绕了 10 轮）</h3>
+<div class="qa"><p class="q">如果先 T2 再 T1，那就是 serializable 但不是 linearizable。</p><p class="a">缺了一半。"T2 排在 T1 前面"只是 serializable 认可的串行顺序，没说真实时间。要不 linearizable，真实时间得和那个顺序打架：真实时间 T1 先写并提交，T2 后读却读到旧值。</p></div>
+<div class="qa"><p class="q">T2 读到 10，我觉得对于 Postgres 来说是错的，因为它是 strong consistency read。</p><p class="a">单机 Postgres、自动提交的单条 SELECT：对，读到 10 是错的，那是 linearizable。但同一台 Postgres，T2 是个 repeatable read 事务，开始时 x 还是 10，中间 T1 提交了 11，T2 再读还是 10。Postgres 自己的隔离级别就能造出"读到旧值"。读写分离下去 replica 读也会。"Postgres 是 strong consistency read"只对"单机 + 最新语句"成立。</p></div>
+<div class="qa"><p class="q">这和 repeatable read 有什么关系？</p><p class="a">它就是那个"serializable 但不 linearizable"的例子本身：T2 开始早、读发生晚、读到旧值。syllabus 给 4(a) 的提示"只读事务读旧快照"说的就是这个。replica 例子是同一回事的另一种来源：一个是时间上的旧（快照冻住），一个是空间上的旧（副本落后）。</p></div>
+<div class="qa"><p class="q">repeatable read 涉及到一个 transaction 里面的多个 read，一个 read 到 old 一个 read 到 new 的？</p><p class="a">反了。一旧一新叫 non-repeatable read，是 read committed 的病；repeatable read 的名字就是把它禁掉，所以全旧。"全旧"正是 4(a) 要的东西：T1 已提交 11，T2 还在读 10。</p></div>
+<div class="qa"><p class="q">"repeatable read 全旧"这是为什么呢？因为 2PL？</p><p class="a">不是 2PL，是 MVCC 的快照规则：T2 txid 12，T1 txid 13 创建的 x=11，13 &gt; 12 永远成立，T2 活多久都看不到 11。对比两种实现 repeatable 的办法：MVCC 让写者绕开读者（读旧版本），2PL 让写者等读者（shared lock 攥到 COMMIT，DB2）。Postgres 是前者，所以是"读不到最新"而不是"别人改不了"。</p></div>
+<div class="qa"><p class="q">MVCC 这个我懂，但是前提是我的 T2 read 是在 T1 开始之前啊。</p><p class="a">前提正确，是 T2 必须在 T1 提交之前<b>开始</b>（不然 txid 更大能看到 11）。但 T2 的<b>读</b>在 T1 提交之后。linearizable 看的是操作（这次读）的时间，不是事务开始时间。事务开始得早、读发生得晚，两个标准看的粒度不同在这里分岔。</p></div>
+<div class="qa"><p class="q">但是你刚刚这么说的：T1 write and commit, and then T2 read。</p><p class="a">抓对了。讲的人之前说"T1 提交后一秒 T2 才开始"，这在单机 Postgres 上<b>不成立</b>（T2 txid 更大直接读到 11），只在多副本下成立（replica 落后）。4(a) 有两个成立的版本：单机 SI（T2 开始 → T1 写提交 → T2 读到 10）和多副本（T1 写提交 → T2 在 replica 开始并读到 10），共同点是这次读在真实时间上晚于 T1 的提交却读到旧值。</p></div>
+<div class="qa"><p class="q">有点意思，这和 transaction 完全没关系了啊，你这是分布式系统的范畴了，你在这讲 serializable 是啥意思？</p><p class="a">这题就是让我拿一个例子证明它们是两个范畴。课程 notes 定义 serializable 时写了"this should remind you of linearizability"，学生总以为 serializable 比 linearizable 强，这题把这个误解打掉：serializable 一点都不管时间，所以一个 serializable 的系统照样可以返回陈旧数据。单机版就够回答这题，replica 版是讲的人多扯的。</p></div>
+<div class="qa"><p class="q">我的理解：从理论上说聊 serializable 或者 transaction 都是 assume request 打到同一个 host，data 只有一个副本（同一版本号，可以有多版本）；说 consistency 是讨论 multiple hosts 一个数据多个副本。这完全不是同一个东西和框架，你让我怎么比较？</p><p class="a">划分基本对，就是 FAQ 那段话的意思（两个词出自两个圈子）。题目不是要比较谁强，要的只有一句：serializable 的定义里没有真实时间。这个性质不需要多副本就能看出来。划分里唯一要修的地方：linearizable 在单机上也有意义，只有一份数据、多个版本，照样可以不 linearizable。</p></div>
+<div class="qa"><p class="q">linearizable 是说 linearizable consistency 吗？</p><p class="a">同一个东西，= linearizability，Raft 和 ZooKeeper 那两篇的主角。这篇里它只客串一次。</p></div>
+<div class="qa"><p class="q">单机谈什么 linearizable？</p><p class="a">定义里没有"副本"这个词：每个操作要么全在另一个之前要么全在之后，且先后和墙上钟一致。Herlihy &amp; Wing 1990 提出它时讨论的是单机多线程共享对象（一个 queue 被几个线程 push/pop），分布式后来借用。单机两类东西可以不 linearizable：多线程下的数据结构（A increment 返回了 B 读到 CPU cache 里的旧值，volatile 和 memory barrier 解决的事）；数据库的 snapshot isolation。形状一样：一个写已完成并返回，一个之后发起的读却没看到它。</p></div>
+<div class="qa"><p class="q">"一个写已经完成并返回，一个之后发起的读却没看到它"，这个在单机版的 Postgres 上面也不会发生吧？</p><p class="a">会，条件是读所在的事务开始得早：T2 BEGIN(repeatable read) → T1 UPDATE x=11 COMMIT（写完成返回）→ T2 SELECT x 读到 10（之后发起的读）。Postgres 文档明写：RR 事务看第一条语句执行时的快照，之后的提交一律不可见。直觉"单机不会发生"是把事务当成了一个瞬间。单机 Postgres 的单条语句是 linearizable 的，RR 事务里的后续读不是。</p></div>
+<div class="qa"><p class="q">所以 Postgres allow begin a transaction 然后 sleep for 10 mins 然后 do select 然后 commit？就是 transaction 里面掺 application logic？</p><p class="a">允许，不限事务时长。DDIA："传统关系数据库不限制事务持续时间，因为它们是为等待人类输入的交互式应用设计的。"这正是 snapshot isolation 存在的理由：长事务（备份、报表）要看一个冻住的世界。代价：旧版本不能 vacuum、锁不放、idle in transaction 占连接池。事务尽量短是惯例不是限制。</p></div>
+
+<h3>复述其他</h3>
+<div class="qa"><p class="q">（cp4b）phantom write。</p><p class="a">名字接近但不是。syllabus 要的异常叫 write skew。关系：write skew 是病（读一个前提、基于它写别处、前提在提交前被改），phantom 是让这个病更难治的一种诱因（别人新插入/删除的行改变了我的查询结果集，没有行可锁）。医生例子不是 phantom（被改的是已存在的行，<code>SELECT FOR UPDATE</code> 能挡），会议室预订才是。</p></div>
+
+<h2 id="experience">5. 与我自己经验的连接</h2>
+<ul>
+  <li><b>pump.fun 的 Postgres 默认 read committed。</b>读不加锁走版本链、写加 exclusive lock 到 COMMIT。两个 UPDATE 互相等、<code>lock_timeout</code> 触发，就是那把写锁。只读查询永远不参与 deadlock。</li>
+  <li><b>读写分离的 replica = checkpoint 4(a) 的多副本版。</b>primary 提交了，应用去 replica 读到旧值，serializable 认、linearizable 不认。</li>
+  <li><b>Postgres 允许事务里掺 application logic、跨网络请求。</b>长事务的代价（vacuum 不了、锁不放、idle in transaction 占连接池）我在生产见过。</li>
+  <li><b>Kafka 事务 = 2PC</b>：<code>__transaction_state</code> 是 TC 的日志，partition leader 是 participant，COMMIT marker 是 COMMIT 消息。省掉 PREPARE 轮因为 participant 永远 YES；没有写锁因为追加不覆盖；阻塞落在 read_committed consumer 的 LSO 上。Kafka idempotent producer 的 sequence number 去重 = 2PC 的 TID 去重 = Raft §8。</li>
+  <li><b>outbox 我经常用。</b>这次说清了它放弃的三样（同时可见、恰好一次、跨系统 abort）和换来的（无锁、无 in-doubt、故障隔离）。判断要不要真 2PC 的一条线：第二个系统有权说 NO 且业务不能忍补偿窗口。</li>
+  <li><b>ZooKeeper 第 5 站的 fuzzy snapshot = read skew</b>，这篇第 2 站从这里接上。ZK 不修靠幂等重放，数据库修靠 snapshot isolation，差别在快照给不给人读。</li>
+  <li><b>ZooKeeper 第 7 站 fencing 的 lost update</b>（不加 last_token 条件，A 的过期计算盖掉 B 的）和这篇第 2 站幕 3 的 lost update 是同一个病，那时是跨进程 GC 暂停，这里是两个并发事务。</li>
+  <li><b>Raft term / ZK epoch / Kafka epoch / fencing token / 2PC 的 TID</b>：单调号让迟到的旧东西被认出来。六周收尾那张表再加一列。</li>
+</ul>
+
+<h2 id="principles">6. 通用原则清单</h2>
+<ol>
+  <li class="principle"><b>三个名字三件事，别混。</b>2PL 管 isolation，2PC 管 atomicity，Raft 管 replication；一个真实系统三个都装，谁也替不了谁。</li>
+  <li class="principle"><b>往上爬一档隔离级别，写锁从来不动，只动读那一列。</b>read committed、snapshot isolation、serializable 的写锁一模一样（exclusive 到 COMMIT）；差别全在读返回哪个版本、读要不要留名。</li>
+  <li class="principle"><b>第二个写者等第一个出结局，因为它的新值要从前驱算出来，而前驱是哪个取决于一个未来事件。</b>undo log、MVCC 只是"等"和"恢复"的机械，机械不是理由。</li>
+  <li class="principle"><b>中间状态可以错，只要没人能看见。</b>锁攥到 COMMIT 不是为了让中间状态不存在，是为了让想看两半的人要么排队要么撞 deadlock 重来。</li>
+  <li class="principle"><b>读锁钉住前提。</b>基于读到的东西做决定、决定要写到别处，前提在提交前被改就是 write skew；只有把前提锁住（2PL）或提交时查前提（SSI）才挡得住，快照隔离挡不住。</li>
+  <li class="principle"><b>"同时"不是分布式系统能承诺的，"最终"才是。</b>锁先后放无所谓，只要结局定下来之前一个都不放；2PC 保证 eventually 不是 simultaneously，这一点放松让它从两将军的不可能变成可能。</li>
+  <li class="principle"><b>承诺之前先落盘。</b>participant 回 YES 前写 PREPARED，TC 发 COMMIT 前写 COMMIT；写盘的那一刻就是不可撤销的那一刻，崩溃后靠它兑现承诺。</li>
+  <li class="principle"><b>查无此事务 = ABORT（对 TC）或 = 已做完（对 participant）。</b>两条推理成立的前提都是"落盘永远在发消息之前"，规则互相咬合。</li>
+  <li class="principle"><b>投出 YES 就交出了决定权。</b>之后两个坏世界在你眼里消息序列相同，信息不够做任何决定，超时不增加信息；想不等就要完美判死，真实网络没有。</li>
+  <li class="principle"><b>可替的东西要多数派，不可替的东西要全体。</b>Raft 的 server 可替所以多数派够、误判不出错、为可用性而生；2PC 的 participant 不可替所以要全体、误判就出错、放大故障。</li>
+  <li class="principle"><b>serializable 的定义里没有时间。</b>一个 serializable 的系统照样可以返回陈旧数据；要"读到最新"得另加 linearizable，两个都要叫 strict serializability。</li>
+  <li class="principle"><b>linearizable 不是多副本专属。</b>"一个写完成并返回、一个之后发起的读没看到它"在单机多线程和单机 snapshot isolation 下都会发生。</li>
+  <li class="principle"><b>追加不覆盖，就不需要写锁。</b>Kafka 的 participant 永远 YES、没有写锁，阻塞转移到要求"已提交 + 按序"的读者身上。</li>
+  <li class="principle"><b>绕开 2PC 的条件是第二个系统无权说 NO。</b>outbox 用本地事务 + 异步投递换掉锁和 in-doubt；第二方可能拒绝且业务不能忍补偿窗口时，绕不开。</li>
+</ol>
+
+<h2 id="recall">7. 复述结果与回忆清单</h2>
+<table>
+<tr><th>道</th><th>考点</th><th>结果</th></tr>
+<tr><td>1</td><td>YES 之后能不能单方面决定</td><td>实。结论秒答；坏世界要追问三次才凑齐（漏了 A 投 NO 那个最直接的）；共同点说"看不到全貌"，补了"消息序列相同"</td></tr>
+<tr><td>2</td><td>全体 vs 多数派</td><td>实。replica 做同一件事 vs 各做各的，追一步就推到"任何一个挂了都不行"</td></tr>
+<tr><td>3</td><td>2PL vs simple locking 例子</td><td>半实。deadlock 秒答；例子要架子（"T1 碰 x 再 y，T2 只碰 y"）才填出来；中间岔出去担心 reader 读到中间态，规则 B 堵死</td></tr>
+<tr><td>4a</td><td>serializable 不 linearizable</td><td>通了，绕 10 轮。根因是"serializable 定义里没有时间"一开始不接受；讲的人第一版例子在单机不成立被我抓出来</td></tr>
+<tr><td>4b</td><td>SI 出 serializable 不出的异常</td><td>半实。名字先说成 phantom，场景会讲，"为什么 SI 抓不到"没主动说</td></tr>
+<tr><td>5</td><td>Raft 复制 TC</td><td>半实。"没法解决只是降低概率"对、"全体同意还在"追问后对；阻塞的根归到了 availability 没接到 cp1 的信息不足上</td></tr>
+</table>
+<p>虚的三处有一个共同点：<b>"X 的定义里到底有什么、没有什么"这种边界问题</b>。serializable 没有时间、write skew 不等于 phantom、阻塞的根是信息不是可用性。实的两道都是"坏场景推规则"，这个一向擅长。</p>
+<p>回忆题（progress.md 反复回忆清单）：① 一句话说出 serializable 和 linearizable 定义差在哪个词，然后给单机 Postgres 的例子；② write skew 和 phantom 的关系，医生例子为什么不是 phantom；③ TC 用 Raft 复制后 B 为什么还是只能等，接到 cp1 的哪句话上；④ no dirty write 在 MVCC 下防什么（我自己那段话）。</p>
+
+<h2 id="reading">8. 延伸阅读</h2>
+<ul>
+  <li>Saltzer, Kaashoek. <a href="https://ocw.mit.edu/courses/res-6-004-principles-of-computer-system-design-an-introduction-spring-2009/pages/open-textbook/"><i>Principles of Computer System Design</i>, Chapter 9: Atomicity</a>. 本篇主读物。§9.1.6 "中间状态可以错只要没人看见"、§9.5.2–9.5.3 三种锁纪律、§9.5.5 deadlock 四招、§9.6.3 persistent sender 与 presumed commit/abort、§9.6.4 两将军。</li>
+  <li>MIT 6.5840 <a href="https://pdos.csail.mit.edu/6.824/notes/l-2pc.txt">Lecture 11 notes</a> 与 <a href="https://pdos.csail.mit.edu/6.824/papers/chapter9-faq.txt">FAQ</a>：x=y=10 转账/审计例子、2PC 逐步崩溃、"Raft 和 2PC 解决不同问题"、3PC 为什么不行、serializable vs linearizable 那段。</li>
+  <li>Kleppmann. <i>Designing Data-Intensive Applications</i> 第 7 章（隔离级别阶梯、MVCC 可见性规则、write skew 与 phantom、2PL、SSI）、第 9 章"原子提交与两阶段提交"（系统承诺、协调者失效、3PC、XA、怀疑时持有锁、分布式事务的限制）。中译 <a href="https://ddia.vonng.com/">ddia.vonng.com</a>。</li>
+  <li>Gray, Reuter. <i>Transaction Processing: Concepts and Techniques</i> (1992). 6.033 把 2PL 的形式化正确性证明推给了它。</li>
+  <li>Berenson et al. <a href="https://www.microsoft.com/en-us/research/publication/a-critique-of-ansi-sql-isolation-levels/">A Critique of ANSI SQL Isolation Levels</a>. SIGMOD 1995. snapshot isolation、write skew 的原始定义，"repeatable read 名字混乱"的根源。</li>
+  <li>Herlihy, Wing. <a href="https://pdos.csail.mit.edu/6.824/papers/p463-herlihy.pdf">Linearizability: A Correctness Condition for Concurrent Objects</a>. TOPLAS 1990. 原本讲单机多线程共享对象，不是多副本。syllabus 第 17 篇。</li>
+  <li>Abadi. <a href="http://dbmsmusings.blogspot.com/2019/01/its-time-to-move-on-from-two-phase.html">It's Time to Move on from Two Phase Commit</a> (2019). 课程 notes 末尾引用的那篇。</li>
+  <li>Lamport, Shostak, Pease. <a href="https://lamport.azurewebsites.net/pubs/byz.pdf">The Byzantine Generals Problem</a>. TOPLAS 1982. 和两将军分清：人撒谎 vs 消息会丢。</li>
+  <li>Kafka <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging">KIP-98: Exactly Once Delivery and Transactional Messaging</a>. <code>__transaction_state</code>、PREPARE_COMMIT、WriteTxnMarker、LSO 的出处。</li>
+  <li>PostgreSQL 文档 <a href="https://www.postgresql.org/docs/current/transaction-iso.html">Transaction Isolation</a>："waits for the first updating transaction to commit or roll back"、repeatable read 看第一条语句时的快照、serializable 用 SSI。</li>
+  <li>Corbett et al. <a href="https://pdos.csail.mit.edu/6.824/papers/spanner.pdf">Spanner: Google's Globally-Distributed Database</a>. OSDI 2012. 下一篇：TC 和 participant 都用 Paxos 复制、2PL+2PC 读写事务、无锁只读事务、external consistency。</li>
+</ul>
+
+</div>
+</body>
+</html>
