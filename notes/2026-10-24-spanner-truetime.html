@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spanner：用等待把不准的时钟变成全局顺序 — 6.5840 论文笔记</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1a1a1a; --muted: #666; --card: #ffffff;
+    --border: #e2e0da; --accent: #b45309; --accent-bg: #fef3e2;
+    --code-bg: #f4f2ec; --q-bg: #f0f4f8; --q-border: #3b6ea5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #191917; --fg: #e8e6e1; --muted: #999; --card: #22221f;
+      --border: #3a3a35; --accent: #e8a04c; --accent-bg: #2e2418;
+      --code-bg: #26261f; --q-bg: #1e2530; --q-border: #6b9bd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  header { border-bottom: 2px solid var(--accent); padding-bottom: 1.2rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; line-height: 1.35; }
+  .meta { color: var(--muted); font-size: .88rem; }
+  .meta a { color: var(--accent); }
+  h2 {
+    font-size: 1.25rem; margin: 2.8rem 0 1rem; padding-left: .6rem;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .5rem; }
+  p { margin: .7rem 0; }
+  a { color: var(--accent); }
+  code {
+    background: var(--code-bg); padding: .12em .35em; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .86em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: .9rem 1rem; overflow-x: auto; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.5rem; font-size: .93rem; }
+  .toc ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .station {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.3rem; margin: 1rem 0;
+  }
+  .station h3 { margin-top: 0; color: var(--accent); }
+  .qa {
+    background: var(--q-bg); border-left: 4px solid var(--q-border);
+    border-radius: 0 8px 8px 0; padding: .8rem 1.1rem; margin: .9rem 0;
+  }
+  .qa .q { font-weight: 600; margin: 0 0 .35rem; }
+  .qa .a { margin: 0; font-size: .95rem; }
+  .principle { margin: .5rem 0; padding-left: .3rem; }
+  .principle b { color: var(--accent); }
+  .tag {
+    display: inline-block; background: var(--accent-bg); color: var(--accent);
+    font-size: .75rem; padding: .1em .6em; border-radius: 99px; margin-right: .4rem;
+  }
+  blockquote {
+    margin: 1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent);
+    background: var(--accent-bg); border-radius: 0 8px 8px 0; font-size: .95rem;
+  }
+  .overflow { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Spanner：用等待把不准的时钟变成全局顺序 — 戳是标签不是时刻、读的戳比大小没意义、假设破了掉的是 safety</h1>
+  <div class="meta">
+    <span class="tag">6.5840</span><span class="tag">论文拆解</span>
+    深读日期：2026-10-15 → 2026-10-23（7 个 session）·
+    论文：<a href="https://pdos.csail.mit.edu/6.824/papers/spanner.pdf">Spanner: Google's Globally-Distributed Database</a>
+    (Corbett et al. · OSDI 2012) · <a href="https://pdos.csail.mit.edu/6.824/notes/l-spanner.txt">6.5840 notes</a> · <a href="https://pdos.csail.mit.edu/6.824/papers/spanner-faq.txt">FAQ</a> · DDIA 第 8 章"不可靠的时钟" · MIT 6.5840 第 3 篇（分布式事务之后，Memcached 之前）
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#summary">论文总结</a></li>
+    <li><a href="#terms">我定的三个词</a></li>
+    <li><a href="#debate">核心争论：读事务之间的戳倒了为什么没事</a></li>
+    <li><a href="#stations">八站机制拆解</a></li>
+    <li><a href="#qa">我的疑问与解惑（本笔记最有价值的部分）</a></li>
+    <li><a href="#experience">与我自己经验的连接</a></li>
+    <li><a href="#principles">通用原则清单</a></li>
+    <li><a href="#recall">复述结果与回忆清单</a></li>
+    <li><a href="#reading">延伸阅读</a></li>
+  </ol>
+</nav>
+
+<h2 id="summary">1. 论文总结</h2>
+
+<p><b>背景。</b>Google 的广告后端 F1 原本跑在手工分片的 MySQL 上，最后一次重新分片花了两年。它要的东西三样都要：跨数据中心同步复制（一个机房挂了还能用）、跨分片事务（改两个账户要原子）、强一致读（改完密码别人立刻看到）。Bigtable 没有跨行事务，Megastore 有但写吞吐差。Spanner 是 2012 年给出的答案，第一个全球规模的、支持 externally consistent 分布式事务的数据库。</p>
+
+<p><b>结构。</b>数据切成几百上千片（tablet），每片一个 Paxos group（论文层面等价于一个 Raft 集群），副本跨数据中心。每个 group 的 leader 上有一张 lock table（2PL）和一个 transaction manager（2PC）。只碰一片的事务不需要 2PC；跨片的读写事务跑 2PC，coordinator 是参与的 group 之一的 leader，participant 和 coordinator 的状态都写进各自的 Paxos log，所以单机崩不再是阻塞点。这就是上一篇第 7 站画的"TC 和 participant 都用 Raft 复制"的实物。F1 的生产数据（Table 6）：读是写的 300 倍，延迟差 10 倍。整篇论文的聪明劲全花在只读事务上。</p>
+
+<p><b>要解决的问题。</b>一个只读事务要跨几片读到<b>同一时刻</b>的数据，不然就是 read skew。"同一时刻"需要一个所有片都认的数。Raft 的 log index 只在一个 group 内有意义，A 的 500 和 B 的 300 没法比；全局一个发号器（zxid 的做法）跨洲每次写都要领号，死路。只剩物理时间：东京的 10:00:00.005 和纽约的 10:00:00.003 直接可比。但物理时钟不准，两台机器差几毫秒是常态，直接用读数当戳会倒：先完成的拿到更大的数。Snowflake ID 就是这个毛病。</p>
+
+<p><b>TrueTime。</b>时钟不返回一个点，返回区间 <code>[earliest, latest]</code>，唯一承诺：真实时间在区间里。区间半宽 ε 来自三项：本地石英钟漂移（按最坏 200 µs/s 算，每 30 秒和 time master 对一次表，所以最多积 6 ms）、和 master 通信的延迟（约 1 ms）、master 自己的不确定。ε 是锯齿形，1 到 7 ms，平均 4 ms。time master 两种：GPS 和原子钟，失败模式不相关；每台机器问多个 master，用 Marzullo 算法剔除撒谎的；实测漂移超限的机器被踢出。<code>TT.after(t)</code> = 区间整个在 t 右边，t 一定过去了；<code>TT.before(t)</code> = 区间整个在 t 左边。<code>TT.now()</code> 不是网络调用，是本机读表加漂移上限，微秒级。</p>
+
+<p><b>读写事务的两条规则（§4.1.2）。</b>Start rule：coordinator 收到 commit 请求后调 TT.now()，取 <b>latest</b> 当 commit 戳 s，保证 s 不比"现在"小。Commit Wait：拿到 s 后不回复客户端、不放锁，等到 <code>TT.after(s)</code> 为真，保证回复时 s 已成"过去"。五行证明：s₁ &lt; T1 完成时刻 &lt; T2 开始时刻 ≤ T2 到服务器时刻 ≤ s₂。两条规则各管一头：取 latest 让我看见所有前人，等让所有后人看见我。代价每次写等约 2ε，和 Paxos 复制并行，Table 3 里关掉 commit wait 9.4 ms、开着 14.4 ms。</p>
+
+<p><b>只读事务（§4.1.3–4.1.4）。</b>开始时取一次 TT.now().latest 当 s_read，不等，不加锁，去本地副本按 snapshot isolation 读戳 ≤ s_read 的最新版本。副本可能落后，所以每个副本维护 t_safe = 已 apply 的最后一条写的戳，读的 s_read ≤ t_safe 才答，否则等。t_safe 成立靠两条前提：leader 发戳随 log 顺序单调涨（Spanner 加的规则），follower 按 log 顺序 apply（Raft 原有）。t_safe 还有第二个分量：group 里有投了 YES 没结局的 2PC 事务 T 时，t_safe 不能超过 T 的 prepare 戳减一，因为 T 的最终戳可能落在读的范围里。两种卡住：group 空闲（leader 每 8 秒发 MinNextTS 承诺"下一条写的戳 ≥ N"，副本推 t_safe 到 N−1）、in-doubt 事务（按 key range 细分）。单 group 的只读事务用 leader 的 LastTS 代替 TT.now().latest，省掉等"未来的写"，只等复制。</p>
+
+<p><b>假设破了（§5.3 和 notes）。</b>ε 变大只影响快慢：写多等 2ε，读等 t_safe 追上，正确性不变。区间不包住真实时间才出错：时钟太快，写事务提前结束 commit wait，戳在未来，之后开始的读看不见它；时钟太慢，戳偏小，和之前正常的写倒。两种都是安静地返回错值，没有报错。Google 敢这么做是因为三层检测把时钟故障率压到比坏 CPU 低 6 倍。这是本课第一个把 <b>safety</b>（不只是 liveness）押在物理世界假设上的系统。</p>
+
+<p><b>结果。</b>Table 3：写 14.4 ms，只读事务 1.4 ms，snapshot read 1.3 ms，只读是写的十分之一。Table 4：2PC 到 50 个 participant 延迟还平，100 个开始涨。Table 6（F1 24 小时）：读 8.7 ms、单片提交 72 ms、跨片提交 103 ms。F1 用 5 个副本（美国东西海岸），failover 对他们"几乎不可见"。CockroachDB 用 HLC 和不确定区重试近似这个设计，没有 TrueTime 所以只到 serializable；AWS DSQL 用 ClockBound 拿了 TrueTime 那一块，把 2PL+2PC 换成 OCC。</p>
+
+<p><b>论文自己的教训（§8）。</b>linchpin 是 TrueTime：把时钟不确定性作为 API 的返回值暴露出来，上层就能建更强的时间语义；底层把 ε 压得越小，上层付的代价越低。"作为一个社区，我们不该再依赖松散同步的时钟和弱时间 API 来设计分布式算法。"</p>
+
+<h2 id="terms">2. 我定的三个词</h2>
+
+<p>第 5 站绕了几十轮，根因是"时间"一个词被三样东西共用。我在 2026-10-20 定了三个词，之后全篇用它们：</p>
+
+<table>
+<tr><th>我的词</th><th>符号</th><th>论文的词</th><th>是什么</th><th>谁知道</th></tr>
+<tr><td><b>selected timestamp</b></td><td>s</td><td>commit timestamp s_i / s_read</td><td>事务从 TT.now() 的区间里挑的那个数，写死在版本上（<code>x@10=9</code> 的 10）</td><td>事务自己；写进数据后所有人</td></tr>
+<tr><td><b>real-world timestamp</b></td><td>t</td><td>t_abs(e)</td><td>某个事件发生那一瞬间的真实时间</td><td>没人精确知道，只知道在区间里</td></tr>
+<tr><td><b>observed complete time</b>（写事务）</td><td>c</td><td>t_abs(e_commit)</td><td>写事务回复客户端那一刻的 t</td><td>客户端观察得到</td></tr>
+</table>
+
+<p>三者关系只有两条，都是写事务的：<b>挑戳时 s ≥ t</b>（取 latest，latest ≥ t）；<b>完成时 s &lt; c</b>（等到 TT.after(s) 才回复）。读事务只有第一条，没有 c。</p>
+
+<p>两个必须分开的东西：<b>TT.now() 的区间</b>（时钟不确定性，宽几毫秒，没人知道真实时间在哪一点）和 <b>linearizability 的区间</b>（一次操作从调用到返回，client 自己知道）。两个都写成一对数字，混了就全乱。还有一个：<b>戳是标签不是测量值</b>。T1 用 .010 做戳，真实发生的时刻不知道，只知道 ≤ .010；标签不精确，但标签的先后和真实先后一致，这是 Spanner 要的全部。</p>
+
+<h2 id="debate">3. 核心争论：读事务之间的戳倒了为什么没事</h2>
+
+<p>这篇最长的一条链。起点是我质疑"读事务不用 commit wait 是因为没人需要看见读事务"这句话：read1 完成后 read2 才开始，read2 不能比 read1 旧，所以读之间也有顺序要求。这个质疑是对的，那句话确实漏了。然后我追了十几轮：读的 s 倒了怎么办、倒的那截里有没有写、100 到 100000 之间会不会有写、单机怎么理解、第三个观察者看到什么。中间讲的人每轮加新概念（safe time、linearizability 生效点、observer）没有止损，我说了"完蛋了我完全糊涂了我太笨了"，止损重开。重开后换成一步一问，四步走通，然后我自己构造了一个完整例子。推导链整理如下。</p>
+
+<blockquote>
+<p><b>0. 为什么要紧。</b>read1 完成后 read2 才开始，是不重叠的两个操作。linearizability 对它们的唯一要求：read2 返回的值不能比 read1 旧。刷新余额看到 100，再刷新看到 80，中间没人动账户，这就是"旧"，时间倒流。read2 比 read1 新、或一样，都允许。</p>
+<p><b>1. 已完成的写，s &lt; c。</b>写事务挑了 s，等到真实时间 &gt; s 才回复，回复那一刻叫 c。所以每个已完成的写 s &lt; c。</p>
+<p><b>2. read1 看见的每个写，s &lt; t₁。</b>read1 读的那一刻真实时间叫 t₁。它能看见的写只有那一刻已经完成的（没完成的写不进可读层，§4.2.1：commit wait 结束前 coordinator 不让任何副本 apply commit 记录）。已完成的 c &lt; t₁，加第 1 步，s &lt; c &lt; t₁。</p>
+<p><b>3. s_read2 &gt; t₁。</b>read2 在 read1 完成后开始，开始时真实时间 t₂ &gt; t₁。read2 挑 s_read2 = latest ≥ t₂。所以 s_read2 &gt; t₁。</p>
+<p><b>4. 合起来。</b>read1 看见的每个写 s &lt; t₁ &lt; s_read2，都在 read2 的"≤ s_read2"范围里。read2 全看见，不会旧。<b>四步里 s_read1 一次都没出现</b>，所以它和 s_read2 谁大谁小无所谓。</p>
+<p><b>5. 精确版那句话。</b>讲的人原来说"(s_read2, s_read1] 里没有已完成的写"，漏了时间限定，我指出"自相矛盾"。精确版：<b>read1 读的那一刻</b>，(s_read2, s_read1] 里没有 read1 看见的写。之后这一截可以被填上，填进去的写两个读都没看见。后来的写 s 比 read1 的 s 小，可以发生，从来不是要排除的；要排除的只是"read1 看见的写 read2 没看见"。</p>
+<p><b>6. "旧"的精确含义。</b>值 1→2→3，read1 返回 3，read2 返回 2，这就是旧。要成立需要 read2 没看见写 3，但写 3 被 read1 看见了，s₃ &lt; t₁ &lt; s_read2，矛盾。读返回的是看见的里 s 最大的，read2 看见的 ⊇ read1 看见的，最大值 ≥ 3。</p>
+<p><b>7. 我自己构造的完整例子。</b>write1 [1,4] t=2 s=4 / read1 [3,12] t=5 s=12 / write2 [6,8] t=7 s=8 / read2 [9,11] t=10 s=11，四个依次发生。read1 s=12 看不见 write2（读的时候 write2 不存在），read2 s=11 看见 write2。read1 的 s 大却看得少，合法。串行顺序 w1→r1→w2→r2 和真实时间一致。</p>
+<p><b>8. 我的收口。</b>"这不是废话吗，read2 物理上在后面当然能看到 read1 看到的一切。"对，是废话，但只在 Spanner 里成立。普通分布式数据库不成立：落后的副本、慢时钟挑小戳、上一篇 4(a) 的 Postgres repeatable read 事务。Spanner 靠三样让它成立：写的 commit wait、读挑 latest、副本的 t_safe。证明是在证"设计让显然的事真的显然"。</p>
+<p><b>9. 另一个收口。</b>"所以 selected timestamp 不会 expose 给 outside。"对。外部观察者只看见调用、返回、返回值，s 是内部挑版本的标签，linearizability 判定不用它。<b>读的 s 比大小没意义，只有写的 s 钉在版本上。</b></p>
+</blockquote>
+
+<p>教训给讲的人：他追问时每轮加新概念是崩掉的原因；该先立住"真实时间 / 区间 / 戳"三样东西的表，一步一问。</p>
+
+<h2 id="stations">4. 八站机制拆解</h2>
+
+<div class="station">
+<h3>第 1 站 · 组装图</h3>
+<p>按数据中心排的图我看不懂，换成按 group 排（Raft 那张图横过来），然后我用 Elasticsearch 对上了：</p>
+<pre><code>group "a–m":   S1@东京(leader)   S2@纽约   S3@伦敦      ← 一个 Paxos group = 一个 Raft 集群
+group "n–z":   S4@东京           S5@纽约(leader)   S6@伦敦      ← 另一个，独立的</code></pre>
+<table>
+<tr><th>Elasticsearch</th><th>Spanner</th></tr>
+<tr><td>index 切成多个 shard</td><td>数据切成多个 tablet</td></tr>
+<tr><td>一个 shard 的 primary + replicas</td><td>一个 Paxos group 的 leader + followers</td></tr>
+<tr><td>replica 放在别的 node</td><td>副本放在别的数据中心</td></tr>
+<tr><td>一个 node 上有多个 shard 的 primary 或 replica</td><td>一个机房里有多个 group 的 leader 或 follower</td></tr>
+<tr><td>shard 之间<b>没有事务</b></td><td>加了 lock table（2PL，只在 leader）和跨 group 2PC</td></tr>
+</table>
+<p>Paxos group = 一个 Raft 集群，Paxos 是算法（Raft 的前辈），group 是跑它的那组机器，FAQ 说论文层面两者无区别。lock table 只在 leader 内存里，不经 Paxos 复制，leader 崩了锁没了事务 abort；写锁和暂存值随 PREPARED 进 Paxos 所以能恢复。Table 6：读 215 亿次 8.7 ms，提交 6300 万次 72–103 ms。</p>
+</div>
+
+<div class="station">
+<h3>第 2 站 · external consistency 与为什么"读最新"不够</h3>
+<p>external consistency = linearizability（§1 原话）= strict serializability（FAQ）= 上一篇第 6 站那张表里"serializable + 顺序和真实时间一致"。我上一篇的总结是"serializable 管 transaction、linearizable 管 consistency，两个范畴"，Spanner 是把两个范畴叠在一起的系统。FAQ 的例子：Hatshepsut 在圣何塞改密码，口头告诉 Cassandra，Cassandra 在圣马特奥登录，必须看到新密码。</p>
+<p>只读事务直接读最新已提交的值不够：T3 读 x 时 T2 没提交、读 y 时 T2 提交了，半个 T2，read skew。修法是 snapshot isolation 带时间戳：</p>
+<pre><code>                      x@10=9         x@20=8
+                      y@10=11        y@20=12
+T1 @10:  Wx  Wy  C
+T2 @20:                   Wx  Wy  C
+T3 @15:              Rx              Ry      ← 两个读都来自 @10，等于串行 T1 → T3 → T2</code></pre>
+<p>T3 读 y 时 T2 已 commit，T3 却读旧的，合法，因为 T3 和 T2 concurrent。全部问题归结为：<b>给每个事务发一个戳，使 T1 真实时间先结束、T2 后开始 ⇒ s₁ &lt; s₂。</b>单机用计数器，跨几百个 leader 计数器不可比，只能用物理时间。</p>
+<p>三种发号对照（我问出来的）：zxid = (epoch, counter)，逻辑，单 leader，严格有序；Snowflake = (毫秒, 机器号, 序号)，物理，多机各发，顺序不可靠（DDIA 脚注）；Spanner 要 Snowflake 的分布式 + zxid 的可靠。</p>
+</div>
+
+<div class="station">
+<h3>第 3 站 · TrueTime</h3>
+<pre><code>TT.now()     → [earliest, latest]    真实时间一定在这中间，具体哪一点不知道
+TT.after(t)  → 区间整个在 t 右边      t 一定过去了
+TT.before(t) → 区间整个在 t 左边      t 一定还没到</code></pre>
+<table>
+<tr><th>ε 的来源</th><th>大小</th></tr>
+<tr><td>本地石英钟漂移，按最坏 200 µs/s 算，每 30 秒对一次表</td><td>0 → 6 ms 锯齿</td></tr>
+<tr><td>和 time master 通信延迟</td><td>约 1 ms</td></tr>
+<tr><td>master 自己的不确定</td><td>GPS 接近 0，原子钟慢慢涨</td></tr>
+</table>
+<p>我两次指出讲的人的漏洞，都对：① TT.now() 不是网络调用，对表每 30 秒后台一次，往返延迟进 ε 的起点，之后本地读表加漂移；区间只对调用那一瞬间成立，所以第 4 站两条规则都写成"在事件之后调"。② "已经发生的往返时间不代表这一次的 latency"：没有"这一次"，只有那一次对表，本次往返实测 2 秒 → 真实时间在 [10:00:00, 10:00:02]（FAQ 原推导），没有一处用过去的延迟估未来。漂移上限 200 µs/s 是硬件规格事先定的，对表时实测超了就踢机器。AWS Time Sync 默认是很准的 NTP（Snowflake 一类），开 ClockBound 才是 TrueTime。</p>
+</div>
+
+<div class="station">
+<h3>第 4 站（心脏站）· 读写事务的戳</h3>
+<p>正确顺序（我说"如果以前按照时间排序其实就很好理解了"，讲的人顺序反了）：</p>
+<pre><code>① 版本带戳按戳读        x@10=9, x@20=8，拿 15 读到 x@10
+② 要的性质              先 commit 的戳 &lt; 后开始的戳
+③ 戳是标签不是测量值     标签 ≥ 真实时刻（取 latest）
+④ commit wait           回复前等到真实时刻 &gt; 标签（≈ 2ε，和 Paxos 复制并行）</code></pre>
+<p><b>没有 commit wait 的反例</b>：T1 在 .000 读到 [.000, .010]，取 s₁ = 10，立刻回复；客户端 .004 发 T2，T2 时钟慢读到 [.000, .008]，取 s₂ = 8 &lt; 10。只读事务挑 9 看见 T2 看不见 T1。病根：s₁ = 10 是"最晚可能"，不是"已经过去"。</p>
+<p><b>commit wait</b>：T1 拿到 10 后反复问时钟，直到区间下端 &gt; 10（[.011, .021]），才回复。回复时真实时间 ≥ .011 &gt; 10，戳落在回复严格之前。T2 之后开始，latest ≥ 真实时间 &gt; 10。</p>
+<p><b>为什么取 latest 不取 earliest</b>：earliest 第一条（戳 &lt; 完成）天然满足不用等，但第二条（戳 ≥ 开始）坏了：T0 用 latest 完成戳 .008，T1 之后开始取 earliest .000 &lt; .008。每个写事务同时是前人的后来者和后人的前人，两条都要。等能补第一条（推迟完成），补不了第二条（开始已发生）。我的总结：<b>"一种 single selection method 保证顺序有传递性，不存在"</b>。Spanner 是挑（latest，不偏早）+ 等（动作，改变"完成"的时刻，不偏晚）。</p>
+<p><b>"完成"的定义是 wait 结束</b>。wait 没结束，数据虽然写进去了，锁没放、客户端没回复，对外等于没发生。"等太久 s₀ &gt; s₁"构造不出来：等多久就把完成推迟多久、把"T1 在我之后开始"的门槛抬多高。多等永远安全，少等才危险。</p>
+<p><b>两种单调分开</b>：同 group 内（计数器 + lease disjointness，zxid 做法，不需要 TrueTime）vs 跨 group（Start rule + Commit Wait，必须 TrueTime）。没有 TrueTime = 几百个独立 ZooKeeper 互相没法比。</p>
+</div>
+
+<div class="station">
+<h3>第 5 站 · 只读事务与 safe time</h3>
+<p><b>幕 1</b>：只读事务开始时调一次 TT.now() 取 latest 当 s_read，不等。写事务四步（取 latest / 写 / 等 / 回复），只读三步（取 latest / 读 / 回复）。<b>取 latest 人人做（我看见前人），等只写事务做（后人看见我）。</b>读不等的精确理由（我质疑后改的）："读不等，不是因为没人需要看见它，而是因为它看见的一切都已被写事务钉成过去，后来的读天然看得见。"</p>
+<p><b>幕 2</b>：副本可能落后。东京 leader apply 到 x@30，伦敦 follower 只到 x@10，读挑 25 去伦敦答 9，错。t_safe = 已 apply 的最后一条写的 s，读 s_read ≤ t_safe 才答。两前提：leader 发戳随 index 单调（Spanner 加的），follower 按 index apply（Raft 原有）。Raft 格子里三个数分开：term（逻辑，选举）、index（逻辑，Raft 原有）、戳（物理，Spanner 加的）。<b>我的对应：Flink watermark</b>，连只涨不缩和 idle source 都一样。</p>
+<p><b>follower 读的定稿版</b>（我要求反省重整后的）：</p>
+<table>
+<tr><th>读几个 group</th><th>s_read 怎么来</th><th>含义</th></tr>
+<tr><td>跨多个</td><td>自己调 TT.now() 取 latest</td><td>我要看到此刻为止的一切</td></tr>
+<tr><td>只一个</td><td>发给那个 group 的 <b>leader</b>，leader 回 LastTS（最后一条已 commit 写的戳）</td><td>我要看到目前为止最新的那条写</td></tr>
+</table>
+<table>
+<tr><th>s_read 来源</th><th>follower 等吗</th></tr>
+<tr><td>TT.now().latest ≈ 现在</td><td>等。等 leader 发出一条 s ≥ 现在的写并复制过来；空闲则等 MinNextTS，最多 8 秒</td></tr>
+<tr><td>LastTS</td><td>可能等，等那条写复制过来，几毫秒到几十毫秒</td></tr>
+</table>
+<p><b>LastTS 省的是"等未来的写"，省不了"等复制"。</b>LastTS 是 leader 挑完 s 后 s 自己变成的（同一动作两面），锯齿贴着现在走，始终落后几毫秒 + ε。基础版 LastTS 是 group 一个数，§4.2.4 修法 per key range（我推出来的，论文 2012 年未实现）。读的 s 挑完就固定，变的是 t_safe。</p>
+</div>
+
+<div class="station">
+<h3>第 6 站 · 时钟坏了会怎样</h3>
+<table>
+<tr><th>情况</th><th>写</th><th>读</th><th>正确性</th></tr>
+<tr><td>ε = 10 秒（区间还包着 t）</td><td>等 2ε = 20 秒</td><td>等 t_safe 涨到 10:15:40，≥ 10 秒</td><td><b>不变</b>，两条关系都成立</td></tr>
+<tr><td>时钟太快（t &lt; earliest）</td><td>提前结束 commit wait，c &lt; s</td><td>之后开始的读 latest &lt; s，看不见</td><td><b>错</b>，第 4 站反例复活</td></tr>
+<tr><td>时钟太慢（t &gt; latest）</td><td>s &lt; t，和之前正常的写倒</td><td>中间的戳看见后者看不见前者</td><td><b>错</b></td></tr>
+</table>
+<p>我的反对，对的："硬件坏了系统不可用，但 clock 坏了影响正确性。"两类故障性质不同：硬件坏 = 不可用、可发现、可重试；时钟坏 = 数据错、安静、不可修。"坏 CPU 比坏钟多 6 倍"不是说时钟坏没关系，是说故障率压到比硬件低且每层有检测。我的总结："时间没有百分之百 work 的东西，tradeoff 是不 work 影不影响 correctness。"</p>
+<table>
+<tr><th>系统</th><th>safety 依赖的假设</th><th>liveness 依赖的假设</th></tr>
+<tr><td>Raft</td><td><b>无</b>（异步模型下无条件）</td><td>多数派活着、网络最终稳定</td></tr>
+<tr><td>2PC</td><td>无（participant 不单方面决定）</td><td>TC 回来</td></tr>
+<tr><td>3PC</td><td>能分清 TC 死了还是网断了 → 没人用</td><td>—</td></tr>
+<tr><td>Spanner</td><td><b>区间包着 t</b></td><td>ε 有界、多数派活着</td></tr>
+<tr><td>CockroachDB</td><td>时钟偏差 ≤ 500 ms</td><td>—</td></tr>
+</table>
+<p>我纠正了讲的人把 Raft 的 liveness 假设说成 safety 假设。Spanner 是本课第一个把 safety 押在物理假设上的系统。</p>
+</div>
+
+<div class="station">
+<h3>第 7 站 · 2PC over Paxos</h3>
+<pre><code>步骤  client                A leader（coordinator）           B leader（participant）
+1     读 x、读 y             拿 x 读锁，返回值                  拿 y 读锁，返回值
+2     算出新值，暂存本地
+3     发 commit：x=11 给 A，y=9 给 B（都标明 A 是 coordinator）
+4                                                              拿 y 写锁；挑 prepare 戳 p_B
+                                                               Paxos 写 "T PREPARED, y=9, p_B"
+                                                               → 告诉 A：prepared, p_B
+5                           拿 x 写锁；收齐 prepared
+                            挑 s = max(TT.now().latest, 所有 p, 自己上一条+1)
+                            Paxos 写 "T COMMIT, s"
+6                           commit wait：等到 TT.after(s)
+7                           → client：成功   → B：COMMIT, s
+8                           apply x@s，放锁                    Paxos 写 COMMIT，apply y@s，放锁</code></pre>
+<p>和上一篇的 2PC 比四处变化：coordinator 是 participant 之一；client 发 PREPARE 并带着写的值（避免跨广域网发两遍）；"写盘"变成 Paxos 写到多数派（leader 崩新 leader 从 log 接着等）；COMMIT 后多一个 commit wait。<b>p_B</b>：B 对 coordinator 说"commit 戳别比我这个数小"，保 B 的 log 戳单调（t_safe 的前提），A 取 max。<b>t_safe 第二个分量</b>：B 上 T prepared 没结局时，只读 R（s=55）该不该看见 T 取决于 s 定成 53 还是 60，B 不知道所以不答；t_safe = min(已 apply 最大 s, 所有 prepared 的 p 最小值 − 1)。我的对应："还是 watermark，两个输入流取 min。"</p>
+<p><b>wound-wait</b>：老事务要新事务的锁直接杀新的，新要老的才等，只有"新等老"一个方向不成环。<b>lease disjointness</b>：新 leader 的票开始 &gt; 旧 leader 的票结束，各自只在票内发戳，换 leader 不倒。票的两端都从 TT.now() 挑，到期判断用 TT.before（区间整个在左边才发，压着就不发，保守让出模糊地带，和 commit wait 镜像）。lease 和 p_B 是同一类：一个防换 leader 弄倒，一个防跨 group 2PC 弄倒，都在给"单 group 戳单调"补洞。坏场景：log y@50 后来了 y@45，t_safe 已说过 ≤50 全到，戳 48 的读一次 y@40 一次 y@45。</p>
+<p>上一篇 2PC 的两个毛病：coordinator 崩了阻塞 → <b>缓解</b>（等的从"修机器"缩到"选 leader"，B 的信息没多一个比特，结构没变）；全体同意 → <b>原样</b>。</p>
+</div>
+
+<div class="station">
+<h3>第 8 站 · 没有 TrueTime 怎么办</h3>
+<table>
+<tr><th></th><th>Spanner</th><th>CockroachDB</th></tr>
+<tr><td>ε</td><td>测量的，1–7 ms</td><td>假设的，max-offset 500 ms</td></tr>
+<tr><td>戳</td><td>TT.now().latest</td><td>HLC（物理时钟 + 逻辑计数器）</td></tr>
+<tr><td>写</td><td>commit wait 2ε</td><td>不等</td></tr>
+<tr><td>读撞上不确定区 (s_R, s_R+500ms]</td><td>不会发生</td><td>abort，推戳，重试</td></tr>
+<tr><td>保证</td><td>external consistency</td><td>serializable（跨机器无消息的因果丢失）</td></tr>
+</table>
+<p><b>Spanner 到底解决什么</b>（我问了三遍才落地）：数据切成几百片放几百个 Raft group 后，让只读事务跨几片读到同一时刻的数据，不加锁、不去 leader、不旧。七步链里第 3 到 7 步全为"只读事务要同一时刻"服务。TrueTime 不代替 Raft，是加在几百个 Raft group 之上解决"共同时间轴"一个问题；解决的是跨 shard 不是跨数据中心（三 shard 同机房照样要，一 shard 跨三洲不要）；Spanner 包含 2PC 不是替代它。<b>Postgres 用"不分片"躲开了问题</b>（一台机器 txid 天然全局，RR 事务扫全表就是 Spanner 的只读事务），Spanner 为必须分片的人设计。Facebook 是几千个 MySQL shard 放弃跨片一致（TAO），F1 广告账目不能忍所以做 Spanner。</p>
+<p><b>pump.fun 跨分片对账</b>：要"所有分片同一时刻的切面"→ 全局戳 + MVCC + t_safe，<b>不要 external consistency</b>（对账不在乎切面是不是最新的）；一台 Postgres 装得下就不需要任何这些；需要 external consistency 的是"A 分片卖币立刻去 B 看余额"。</p>
+</div>
+
+<h2 id="qa">5. 我的疑问与解惑</h2>
+
+<h3>开场与第 1–2 站</h3>
+<div class="qa"><p class="q">【回忆】ZK 写吞吐随 server 数降的根因？</p><p class="a">我答"所有写经 leader、propagate 到大多数、leader load 大"，方向对；精确词是 leader 给<b>每个</b> follower 发 PROPOSAL+COMMIT，13 台发 24 份，等 ACK 只等多数派。追问"给每个 follower 发是啥意思"→ Zab 四步 + 份数表。</p></div>
+<div class="qa"><p class="q">【校准】三个数据中心各自 Postgres 的 txid 能当跨机器时间戳吗？</p><p class="a">我答"不行，txid 不是递增的"。压一层：每台自己递增，跨机器不可比（没有共同起点）。两条路：全局发号器（跨洲往返，死路）或物理时间（表不准）。Spanner 走后者，整篇在处理"表不准"。</p></div>
+<div class="qa"><p class="q">Raft 有点忘记了。leaderCommit 和 AppendEntries 怎么 work？</p><p class="a">一条消息装 entries（复制）和 leaderCommit（告知定了）；follower 落盘 ≠ commit，leader 数够多数派后在下一条里捎 leaderCommit；Zab 拆成两条消息。我主动想起 Figure 8"要等 commit index 的 term 和 current leader 一样"，补了为什么（S5 term 3 log 短但 term 高会覆盖多数派上的 term 2）。"no-op AppendEntries 长什么样"→ 普通 entry，command 空。"[4] 也会 replicate 到 followers？"→ 必须，不复制 S2 S3 末尾还是 term 2 照样投给 S5。我的总结"新 leader 上任发 no-op，等它落到多数派才连带之前的一起 commit"→ 对，no-op 只是触发器。</p></div>
+<div class="qa"><p class="q">follower 其他地方可以还落后，这不对吧，应该大于一半的 follower 的 log 和 leader 完全一样？</p><p class="a">我说的"in sync 只比 latest term"是对的（一致性检查归纳）；精确版：多数派里每台到 commit 那一格为止和 leader 一样，那格之后可以缺，多数派之外可以乱。</p></div>
+<div class="qa"><p class="q">啥是 Paxos group？我晕，我还以为是一个 Paxos 算法。S1 S2 S3 啥意思？</p><p class="a">Paxos 是算法（Raft 的前辈），Paxos group 是跑它的那组机器 = 一个 Raft 集群，FAQ 说论文层面无区别。S1 S2 S3 是机器编号，Raft 图横过来写并标城市。我用 ES primary/replica 对上了。</p></div>
+<div class="qa"><p class="q">再帮我回忆一下 2PC。2PC 必须要 participant 支持 lock 吗？TID 是单调递增的吗？TID 怎么 unique？ZK 的 zxid 怎么生成的？有点像 Snowflake ID？</p><p class="a">2PC 不必须锁：只要求 YES 之后能兑现能撤销，锁是数据库 participant 的办法（覆盖写要拦第二个写者），Kafka participant 没锁（追加）。TID 不需递增只需唯一（归类消息、去重），Spanner 要递增的是 commit timestamp。TID 唯一：单 TC 计数器 / (TC 编号, 计数器) / UUID。zxid = (epoch 32, counter 32)，leader 发，比 TID 多"能比大小"，代价单 leader。Snowflake 形状像但高位是物理毫秒、多机各发、顺序不可靠。</p></div>
+
+<h3>第 3 站 TrueTime</h3>
+<div class="qa"><p class="q">这和 AWS Time Sync 有啥不同？</p><p class="a">（论文外）底层同（GPS+原子钟 reference），接口不同：默认 NTP 给点 = Snowflake 一类；ClockBound 给区间 = TrueTime，DSQL / Aurora Limitless 用它发 commit timestamp。</p></div>
+<div class="qa"><p class="q">没完，这个不对，你没考虑 response time，如果 response 过了一小时才到 client，这个区间也不对。</p><p class="a">我对。讲的人漏讲了 TT.now() 不是网络调用：对表每 30 秒后台一次，往返延迟进 ε 的起点；TT.now() 本地读表 + 漂移。区间只对调用那一瞬间成立，所以第 4 站两条规则都写成"在事件之后调"。</p></div>
+<div class="qa"><p class="q">还是不对，已经发生的往返时间不代表这一次的 latency。</p><p class="a">我对。没有"这一次"，只有那一次对表：本次往返实测 2s → master 读表在 [t₀, t₀+2s] 某点 → 现在真实时间在 [10:00:00, 10:00:02]（FAQ 原推导）。之后只用本机表 + 漂移上限，没有一处用过去的延迟估未来。</p></div>
+<div class="qa"><p class="q">这个 2ms 加减我不懂。所以石英钟的漂移上限是 pre-known 的？</p><p class="a">本机表走 10 秒，真实走了 9.998–10.002 s（200 µs/s × 10 s），区间两端各放宽 2 ms，锯齿形的来源。上限是硬件规格 + 保守余量，事先定 200 µs/s（§3）；配套检查：对表时实测漂移超了就踢机器；§5.3 坏 CPU 比坏钟多 6 倍。两个"事先知道"：漂移上限、master 诚实（Marzullo）。</p></div>
+
+<h3>第 4 站 commit wait</h3>
+<div class="qa"><p class="q">没懂，时间和锁什么关系。我完全糊涂了，好像跳过了什么。再往前一步。time 和 table 什么关系。Spanner 给每个事务发 timestamp、写的数据带戳，这个我们过了吗？</p><p class="a">连环红旗。讲的人把放锁和回复客户端写在一起了；"表"是口语指时钟不是数据库 table；第 2 站只给图没走"版本带戳按戳读"。补：(x, ts)→value 多版本、读挑 ≤ 自己戳的最大版本、T1@10/T2@20/T3@15。我说"如果以前按照时间排序其实就很好理解了"。教训：第 4 站正确顺序是 ① 版本带戳按戳读 ② 要的性质 ③ 时钟不同步会倒 ④ 区间 + commit wait。</p></div>
+<div class="qa"><p class="q">为啥不在第一步直接说现在是 .000？返回区间 [.000, .010] 不就 imply 现在肯定 after .000 吗？</p><p class="a">时钟不知道，只知道区间（2 秒例子，去程回程看不见）；普通时钟是猜一个点。.000 确实是过去，但当不了戳：T2 取下端可以比 T1 的下端更小（纽约慢），所以两头都取上端，上端不是过去所以要等。</p></div>
+<div class="qa"><p class="q">返回的时候现在其实至少是 .011 了而不是 .010。如果 client 总是得到一个过去的 timestamp，意义在哪？</p><p class="a">对，正是要的，戳落在回复严格之前。意义在戳和回复的先后：客户端的每个后续动作都发生在它已知的所有戳之后；没有这个，客户端拿着一个"未来的戳"告诉别人"我改完了"，别人开始的事务可能戳更小。</p></div>
+<div class="qa"><p class="q">你需要重新想想怎么解释，之前说是 range 现在又变成时间点，confuse。</p><p class="a">我对。三样东西没分清：真实时间（看不见的点）/ TT.now() 返回值（区间，包住真实时间）/ 戳（T1 从区间挑的数，点）。我的总结："所以 T1 的 action 用 .010 stamp，但真实发生的时间点不一定？"→ 对，戳是标签不是测量值。</p></div>
+<div class="qa"><p class="q">这么做的意义是 ensure 每个 client 看到的 operation sequential by time？所以这比 logic clock 更强大？所以这几乎是 linearizability，除了没法辨别 concurrent？具体执行时不能 random select 吧？timestamp literally 一模一样呢？</p><p class="a">比"每个 client"大：任何人、任何数据中心、不知道对方，T1 结束在 T2 开始前就都看到 T1 在前 = external consistency。比逻辑时钟强在能看见系统外的因果（口头传话），真实时间是所有人共享的隐式信道。不是几乎，就是 linearizability，concurrent 任选是定义自带的。不随机也不是挑，戳自然决定（各取上端谁大谁后），定下后全系统一致。同 group 内不会一样（monotonicity invariant），跨 group 可以一样，此时必 concurrent 且改的是不同 group 的数据。</p></div>
+<div class="qa"><p class="q">Paxos write 戳严格单调递增跨 leader 也成立，那还需要 TrueTime 做 ordering 吗？</p><p class="a">两种单调分开：同 group 内（计数器 + lease，zxid 做法，不需要 TrueTime）vs 跨 group（Start rule + Commit Wait，必须）。"跨 leader"指同 group 换 leader。没有 TrueTime = 几百个独立 ZK 互相没法比。我："痛了。"</p></div>
+<div class="qa"><p class="q">这和 AWS DSQL 差不多，DSQL 是不是抄袭 Spanner？</p><p class="a">（论文外）同一个零件不同的机器：TrueTime + commit wait 那块一样（ClockBound），2PL + 2PC 那块换成 OCC + adjudicator + journal，存算分离。</p></div>
+<div class="qa"><p class="q">为什么有时候 wait for time pass，有时候用 upper bound？我懂定义但不懂 why。从第一性原理解释本质，怎么想出来的？第一条直接用 lower bound 不就好了？</p><p class="a">取右端人人做（我看见前人），等只写事务做（后人看见我）。两个反例：取左端 → T2 左端 −.005 &lt; s₁；写不等 → 幕 1 反例；读也等 → 白等。六步推导：问题 → 时钟有误差任何直接读数方案都能被打败 → 唯一出路是知道误差多大 → 用真实时间当中介需要两条 → 第二条取右端天然满足，第一条靠控制"完成"的时刻 → 读只需第二条。本质：没有共同时钟但有共同真实时间，用等把不确定的读数变成确定的先后。左端满足第一条毁第二条。我的总结："一种 single selection method 保证顺序有传递性，不存在？"→ 对。</p></div>
+<div class="qa"><p class="q">为啥不能是选 lower bound 和等？T0 也不能无限 wait 吧？本来等 100ms 结果 GC 等了 10s，T0 比 T1 都大了咋办？目标是 real world T0 &lt; T1 ⇒ ST0 &lt; ST1，ST0 等太久 ST0 &gt; ST1 呢？T0 完成的定义是 operation 完成还是 wait 完成？先 operate 再 wait 还是 wait 再 complete？</p><p class="a">等只能推迟"完成"，只能修"戳太晚"，左端的毛病是"戳太早"等不着。上界 ≈ 2ε，和 Paxos 复制并行。戳在挑的那一刻定了不变，变的是回复时刻；多等永远安全。分歧根在"T0 &lt; T1"的定义：T0 的<b>完成</b>时刻 &lt; T1 的开始时刻；等多久就把完成推迟多久、门槛抬多高。完成 = wait 完成，论文写死；wait 结束前没人能知道 T0 成功，"operation 完成但 wait 没完成"对外部观察者不存在。三步：挑戳 + Paxos 复制（并行）→ wait → 回复放锁。</p></div>
+
+<h3>第 5 站 只读事务与 safe time（含崩掉的那段）</h3>
+<div class="qa"><p class="q">【重捋】TT.now 返回什么、为啥有的直接取 upper bound、有的等 upper bound 过去、为啥选 upper bound，重新屡屡。</p><p class="a">五块 + 总表"挑 latest 为看见前人，等为被后人看见"。</p></div>
+<div class="qa"><p class="q">戳 T1 &lt; 戳 T2 不代表 T1 物理先发生吧？不对，物理上 t1 write 3、t2 read、t3 write 4、t4 read，t4 戳比 t1 小不 make sense。</p><p class="a">对，戳定义虚构串行队列，只约束不重叠的和物理一致，重叠的随意。四个不重叠构造不出来：t4 的 latest &gt; t1 的戳。我："隐隐约约有点懂了。"</p></div>
+<div class="qa"><p class="q">等的目的是让后人看见我、读不等——不对，read t1 读到新值后 read t2 不能读到旧值，你的意思 reads 之间没 ordering？</p><p class="a">好问题，那句漏了。T2 在 T1 后开始 ⇒ 也在 W 完成后开始 ⇒ T2 latest &gt; W 的戳 ⇒ 也看见 W。T1 没制造新信息只转述 W 已公开的事实。读之间戳可能倒但看见的内容单调。见第 3 节推导链。</p></div>
+<div class="qa"><p class="q">别提 replica。write t1 x=4、write t2 x=5、read t3 读到 4，能发生吗？</p><p class="a">不重叠构造不出（t3 latest &gt; 20 读到 5）；t3 和 t2 重叠（t2 在 commit wait）则 t3 latest 15 看 x@10=4，合法，5 对任何人还不可见。我的总结："从外部观察者角度 concurrent request 顺序不确定，不一定按物理时间排。"→ 对，重叠的请求对观察者来说物理顺序本身不存在。</p></div>
+<div class="qa"><p class="q">只读事务取上端不用 commit wait 有问题，你怎么知道 latest timestamp smaller than s₁，所有 time 都是区间。让客户端等到 certain time 是 TT.now 吗？TT.now()=s₁ 意思是当前时间肯定在 s₁ 之后？</p><p class="a">比的是两个点（s₁、s_read），区间只在推导"右端 ≥ 真实时间"用一次。等的是 coordinator leader 不是客户端。区间整个落在 s₁ 右边才是。</p></div>
+<div class="qa"><p class="q">wait 结束后任何 node 的 lower bound 不可能比 10 小？write 戳 10，read 拿到 [9,11] 怎么知道先后？read 区间是 [0,10000] 呢？0 远早于 10，read 看见物理时间之后的 value 不奇怪吗？第三个观察者看 reader 0 开始、writer 10 写 1000、reader 拿到 1000？所以 time range 的 left/right 是 client 看到的 request start/end，timestamp 是 server 在区间里选？</p><p class="a">是 <b>upper</b> bound，左端可以小。不用知道先后：不重叠的 read 右端必 &gt; 10，重叠的任选。[0,10000] 正确性不变，代价是副本 t_safe 追不上读阻塞。标签 ≠ 真实时间。合理：重叠任选 + RO 一旦挑 10000 就承诺看 ≤ 10000 的世界。不是，那是 linearizability 的调用-返回区间，和 TT 区间是两个东西。→ 我："完蛋了我完全糊涂了我太笨了。"止损。</p></div>
+<div class="qa"><p class="q">【止损后】我不懂的是 read 必须 read latest transaction smaller than read's timestamp，如果 read timestamp 是 range 你不知道谁是 latest。</p><p class="a">卡点找到了：read 的 timestamp 不是 range，是从 range 挑出的一个数，挑完就扔；比的是数和数。不确定性在"戳和真实开始时刻的关系"，但规则是"看戳 ≤ 15 的"不是"看真实时间在我之前的"，所以不需要知道。</p></div>
+<div class="qa"><p class="q">sequential consistency 要求同一 process 看到自己 operation 顺序执行，maybe TrueTime range 是 overlap 的？</p><p class="a">新角度。先写后读靠 commit wait（T2 右端 &gt; s₁）；先读后写 T3 右端可能 &lt; T2 的 15，不算倒置（T2 不该看见 T3）；实现上 leader 用 s_max 把 T3 抬到 &gt; 15，靠 group 内单调不靠 TrueTime。</p></div>
+<div class="qa"><p class="q">想出这个 idea 的人思想过程是什么？这理论谁想的？我忘了我为啥纠结这个了。</p><p class="a">（论文外）四步：Bigtable cell 本就带 timestamp → 直接用会倒（Lamport 1978 physical clocks）→ Lamport 的"等 δ"搬到写事务自己身上 → 真正新的是让时钟报 δ。Lamport 1978 是源头，Liskov 1993 整理过，TrueTime 工程部分论文说另发但没发，Brewer 2013 解释为何敢。倒回去：起点是我质疑"读不等是因为没人需要看见读事务"，终点是要求存在但由写的 commit wait 自动满足。</p></div>
+<div class="qa"><p class="q">【safe time】t_safe 怎么算的？read 的 selected timestamp 会变小不是吗？我以为 t_safe 是 leader 算出来 propagate 到 follower 的？t_safe 不会变小，即使第二个 read 的 s 变小？</p><p class="a">这台副本已 apply 的最后一条写的 s，读最后一条不用算。读的 s 挑完固定，变的是 t_safe。每台副本自己算，leader 只发写不发 t_safe（例外：空闲时 MinNextTS 承诺）；都去 leader 则 t_safe 永远最新。对，两个数各走各的，只在"s ≤ t_safe 才答"一处碰面。我："好吧这就是 Flink 的 watermark。"</p></div>
+<div class="qa"><p class="q">leader 按戳递增发、follower 按序 apply，这是啥？是 term 吗？</p><p class="a">不是，格子里三个数分开：term（逻辑，选举）/ index（逻辑，Raft 原有）/ 戳（物理，Spanner 加的）。戳随 index 单调是 Spanner 加的规则，按 index apply 是 Raft 原有，合起来 apply 到戳 30 ⇔ ≤ 30 全到。</p></div>
+<div class="qa"><p class="q">单机 read1 完成 read2 开始但 read1 戳大。read1 100000、read2 100，中间不会有 write？你说不会有我说会有，自相矛盾。你以后解释东西一个一个来，我连第一句都不懂你还说那么多。第一步错了，write 用 upper bound 所以戳 &gt; 实际 write time。</p><p class="a">(14,15] 里装不下任何已完成的写。会有但在 read1 完成之后；读的时候那截是空的。不同时刻。改成一步一问。挑戳时刻 A（s ≥ t）vs 完成时刻 C（s &lt; c），中间隔 commit wait，不矛盾。然后我定了 s / t / c 三个词。"成立，but why it matters"→ read1 的 100000 是虚的，比 t₁ 大出的那截没有已完成写；read2 的 s ≥ t₂ &gt; t₁ &gt; 所有 read1 看见的 s。</p></div>
+
+<h3>第 6 站</h3>
+<div class="qa"><p class="q">不对，硬件坏了系统不可用，但 clock 坏了会影响正确性。我很惊讶 Google 做这样的权衡，我感觉硬件不那么 reliable。时间没有百分之百 work 的东西，tradeoff 是不 work 影不影响 correctness。Raft 押在多数派不同时崩，这说法也不对吧，多数派崩了只是 unavailable。</p><p class="a">全部对。两类故障性质不同；不是信单块钟，是三层检测；Raft 假设破了掉可用性，Spanner 假设破了掉正确性，所以要求运维纪律高得多，十年只有 Google 和 AWS 敢。分水岭：每个系统都押一个假设，区别在破了掉 liveness 还是掉 safety。讲的人把 Raft 的 liveness 假设说成 safety 假设，Raft/2PC 的 safety 不依赖任何假设。</p></div>
+
+<h3>第 7 站</h3>
+<div class="qa"><p class="q">戳 p_B 啥意思？这种情况下 B 会 wait 对吗？再讲一遍。从头开始讲。写到 Paxos log 是什么意思，follower 也 record 了 leader 也 commit 了？为啥 A 的 picked timestamp 要比 B 的小？所以是 max(a, b)？</p><p class="a">p_B 是 B 对 coordinator 说"commit 戳别比我这个数小"，保 B 的 log 戳单调。对，B in-doubt 攥 y 写锁，和上一篇一字不变。重讲三步 / 五句。写 Paxos log = Raft 追加 + 复制多数派 + commit，两个都是。方向反了，是大：s ≥ p_B，三项取 max。</p></div>
+<div class="qa"><p class="q">没懂。R 是啥 T 是啥 s 是啥？这不是 dirty read 吗，R 不该看见因为没 commit。T 的 s 可以定成比 55 还大吗？说白了还是 watermark，s 不确定比 55 小还是大，但 watermark 只能递增？</p><p class="a">三字母表。对一半：R 绝不看半成品；另一半：R 也不能现在拿 y@50 走，因为 s 若定成 53 ≤ 55，T 就是 R 该看见的已完成写。可以，s 只有下限没上限；B 等的不是 T commit 而是知道 s 是几。对：t_safe 两个分量 = 两个输入流的 watermark 取 min。</p></div>
+<div class="qa"><p class="q">【lease】2 不懂。这里的时间也是 TT.now 那种区间？L1 发戳时 TT.now 区间和票结束重合会怎样？理解正确性了，但为啥需要 lease 之间戳递增且不重合？大概懂了，但这部分有点绕，过几天未必记得。</p><p class="a">先坏场景：旧 leader 隔离中发 50，新 leader 发 45，倒了。对，票开始取 latest、票结束 = follower 的 latest+10 取最早、到期判断用 TT.after。grey area 论文专门处理：L1 用 TT.before(票结束)，压着就不发，保守让出模糊地带，和 commit wait 镜像。为保住 t_safe 的前提"同 group 戳单调"，换 leader 是唯一打破它的地方；lease 和 p_B 是同一类。进反复回忆清单。</p></div>
+
+<h3>第 8 站与复述中的追问</h3>
+<div class="qa"><p class="q">Postgres 为啥不行，single writer 所以 txid 是全局的吧？你为啥总问我们公司咋弄的？</p><p class="a">单台行；"不行"指分片成多台独立 Postgres 后 txid 不可比。我顺手指出出路：不分片则单机 snapshot isolation 就是全部。syllabus 要求的"对应他手上的模式"，但这篇已答完；以后只在 syllabus 明确处问一次，不追。</p></div>
+<div class="qa"><p class="q">两个 sequential read，read2 的 s 更小允许吗？这有没有违反 linearizability？所以 selected timestamp 不会 expose 给 outside？</p><p class="a">允许（第二次问，进回忆清单）。没有，判定只看调用/返回/返回值。对，s 是内部标签，外部只看三样；边界：客户端可主动要戳（snapshot read、commit 回复带 s）。</p></div>
+<div class="qa"><p class="q">你有点 contradictory，之前证明不存在 write 在 read1 read2 之间，你自己去看 chat history。</p><p class="a">对，原话漏了时间限定；精确版：<b>read1 读的那一刻</b> (s₂, s₁] 里没有 read1 看见的写；之后可被填上。两次结论不矛盾，第一次说漏了"那一刻"。</p></div>
+<div class="qa"><p class="q">follower 那个越想越奇怪：follower 挑 s_read = latest 几乎肯定比它当前最大戳小，因为复制有延迟，所以 follower 读几乎都要等？</p><p class="a">方向反了：s_read ≈ 现在，t_safe 是过去某时刻 leader 挑的 + 复制延迟，所以 s_read &gt; t_safe；结论"几乎都要等"对，原因是 watermark 落后不是领先。</p></div>
+<div class="qa"><p class="q">LastTS 让 s_read ≤ t_safe 几乎总成立也是错的：read1 打 leader 读到最新，read2 打 follower 有 delay 读到旧值。我更糊涂了，你一下这个一下那个，把 replica 部分重新整理反省更正再讲。</p><p class="a">我对。两点：LastTS 是 leader 给的（§4.2.2 原话），不是 follower 自己看尾巴；拿了戳去 follower 仍要过 t_safe，50 &gt; 40 等。讲的人反省三错，重讲为一张图（第 5 站卡片的定稿版）。LastTS 省的是"等未来的写"，省不了"等复制"。</p></div>
+<div class="qa"><p class="q">LastTS 和 latest 差不多吧，有 write 时几乎一样，区别只在没 write 时，除非 ts 是 per key 不是 global？DDB 那种流量下 latest ≈ leader 最高 ts 对吗？LastTS ≈ 现在 − 几毫秒不对，难道不是 leader 先 update LastTS 再选 latest？所以 follower 的 read 也要先去 leader 拿 ts？</p><p class="a">三件对两件，第三件论文帮我说了：基础 LastTS 是 group 一个数，§4.2.4 修法 per key range，2012 年未实现。差几毫秒 + ε 恰是会不会等的分界。顺序反了：挑 s 和更新 LastTS 是同一动作两面，LastTS = 上一次有人挑 latest 时挑出的值。论文实现是（§4.2.2 原话 only at a Paxos leader）；小消息不带数据。</p></div>
+<div class="qa"><p class="q">感觉 Spanner 能力很差，inherently latency 高：读 follower 要等 catchup + 还要去 leader 拿 ts。snapshot read 怎么实现，存每个 timestamp/key 的 value？找 ≤ t 的最大是 binary search 吧？</p><p class="a">两条都对；分和谁比：vs 不保证一致的系统确实慢，是买 external consistency 的价；vs 自己的写只读 1.4 ms 是写的 1/10。对，§2.1 (key, timestamp)→value，MVCC，GC 保留窗口可配。逻辑上是，实现上 B-tree 复合键 (key, ts 降序) 一次 seek（Bigtable / LevelDB，非本文）。</p></div>
+<div class="qa"><p class="q">Raft 也有类似的 follower read，问 leader 的 committed index？你自己看看 Raft 论文，我不记得有 blocking wait 这个东西。还有办法回忆起来吗？难道我记错了，那是 ZK 的 mechanism？</p><p class="a">我对，讲的人两次把 etcd 的东西挂到 Raft 名下。Raft extended 论文 §8 只有 leader 读（no-op + 心跳确认）；ReadIndex 出自 Ongaro 博士论文 §6.4 / etcd。查 transcript：三档读表是 ZK session 第 7 站讲的，当时标"Raft §8 提到"也不准；9/28 Raft 热身我就纠正过。三行分开：Raft 论文只有 leader 读 / etcd ReadIndex / ZK 默认直接读 + sync()。</p></div>
+<div class="qa"><p class="q">Spanner 跟 Raft 有什么区别？Raft 也是 follower 确保和 leader in sync，省掉 TrueTime 这套为什么不能用 Raft？所以本质上解决的是跨数据中心的问题？所以 Spanner 是 2PC 的替代品？我还是不懂 Spanner 到底解决什么问题。那 Postgres 怎么解决这个问题？Facebook 用的是 Postgres，那个数据量一个 writer 扛得住？</p><p class="a">单 group 内 Raft 够用；跨 group Raft index 不可比。不是跨 DC 是跨 shard。不是替代是包含。一句话 + 七步链（见第 8 站卡片）。Postgres 不解决没这问题，用不分片躲开。Facebook 是 MySQL 几千个 shard 放弃跨片一致（TAO）。</p></div>
+<div class="qa"><p class="q">【cp5】c 是啥？为啥 R 看不到 W，R 物理在 W 之后；你说 s 不 expose、操作间也不按 s 排序。还是不懂，R 到底看不看得到 W？Spanner 实现里有这个细节吗，read 只看 s 小的 value？这也和 MVCC 有关系吗？</p><p class="a">重贴三词表。读的 s 之间不排序（对）vs 读按自己的 s 挑版本（对）不冲突；R 看不看 W 只看 115 ≤ 106 否；"物理在后 ⇒ s 更大"是 commit wait 推出来的不是天然的，时钟破了推导断。看不到，一步。是基础不是细节：§4.1.4、§4.1.3、FAQ 原话。就是 MVCC，版本号从 txid 换成时间戳，只是 txid 不会倒、时间戳时钟坏了会倒。</p></div>
+
+<h2 id="experience">6. 与我自己经验的连接</h2>
+<ul>
+  <li><b>Elasticsearch primary/replica = Spanner Paxos group。</b>结构一模一样，差别是 ES shard 之间没有事务，Spanner 加了 lock table 和跨 group 2PC。以后画组装图直接用这个。</li>
+  <li><b>Flink watermark = t_safe。</b>watermark(t) = t 之前都到齐 ⇔ t_safe = ≤ t_safe 的写都 apply 了；窗口等 watermark 过了窗口尾 ⇔ 读等 t_safe 过了它的戳；idle source ⇔ 空闲 group，idle timeout ⇔ MinNextTS 每 8 秒；两个输入流 watermark 取 min ⇔ t_safe 两个分量取 min。差别：Flink 启发式允许迟到，Spanner 硬保证无迟到。</li>
+  <li><b>Snowflake ID vs zxid vs Spanner 戳。</b>Snowflake 高位是物理毫秒、多机各发、顺序不可靠；zxid 高位是逻辑 epoch、单 leader、严格有序；Spanner 要前者的分布式 + 后者的可靠，靠 TrueTime + commit wait。</li>
+  <li><b>Postgres MVCC = Spanner 的读规则。</b>xmin/xmax 换成 commit timestamp，可见性"创建者已提交且 ≤ 我的快照"换成"s ≤ s_read 的最大版本"。单机 Postgres 的 REPEATABLE READ 事务扫全表就是 Spanner 的只读事务，不需要任何 TrueTime。</li>
+  <li><b>pump.fun 跨分片对账</b>要的是"所有分片同一时刻的切面"，需要全局戳 + MVCC + t_safe，不需要 external consistency；一台 Postgres 装得下就什么都不需要；分片了用 CockroachDB 够。需要 external consistency 的是"A 分片卖币立刻去 B 看余额"，读写分离的 replica 会漏，走 primary。</li>
+  <li><b>Kafka 的 ReadIndex 直觉。</b>我以为 Raft 有 follower 读 + 等 commitIndex，其实是 etcd 的 ReadIndex（Ongaro 博士论文），Raft 论文只有 leader 读。和 Spanner 的 follower 读并排：问 leader 要水位（commitIndex vs LastTS）→ 等本地追上 → 读本地，同一模式。</li>
+  <li><b>AWS Time Sync / ClockBound / DSQL。</b>默认 Time Sync 是很准的 NTP，开 ClockBound 才给区间 = TrueTime；DSQL 拿了 TrueTime + commit wait，把 2PL + 2PC 换成 OCC。</li>
+  <li><b>Facebook 的 MySQL 分片</b>走的是"分片但放弃跨片一致"，和上一篇的 outbox 一个思路；F1 广告账目不能忍所以做 Spanner。第 4 篇 Memcached 再碰。</li>
+</ul>
+
+<h2 id="principles">7. 通用原则清单</h2>
+<ol>
+  <li class="principle"><b>戳是标签不是测量值。</b>T1 用 .010 做戳，真实发生的时刻不知道；只需两条：标签 ≥ 挑戳时的真实时刻，回复时真实时刻 &gt; 标签。标签不精确，但先后和真实一致。</li>
+  <li class="principle"><b>没有共同的时钟，但有共同的真实时间。</b>两台机器的读数不可比，但"T2 在 T1 回复之后开始"这个事实对所有人成立；用等待把不确定的读数变成确定的先后。</li>
+  <li class="principle"><b>挑 latest 是为了看见前人，等是为了被后人看见。</b>每个写事务同时是前人的后来者和后人的前人，两条都要；读事务只有前一条，所以不等。</li>
+  <li class="principle"><b>单靠从区间挑一个数做不到传递性，挑 + 等才行。</b>等是动作不是选择，它改变"完成"这个事件发生的时刻；等只能修"戳太晚"，修不了"戳太早"，所以必须挑 latest。</li>
+  <li class="principle"><b>"完成"= 对外可见的那一刻。</b>wait 没结束，数据在但锁没放客户端没回复，对外等于没发生；等多久就把完成推迟多久，所以多等永远安全。</li>
+  <li class="principle"><b>读的戳比大小没意义，只有写的戳钉在版本上。</b>读之间只需"看见的写不倒退"，这由写的 commit wait 保证，读自己什么都不用做；读的戳不暴露给外部，linearizability 判定只看返回值。</li>
+  <li class="principle"><b>副本靠 watermark 判断够不够新，前提是写按戳单调到达。</b>任何会打破单调的地方（换 leader、跨 group 2PC）都要补洞（lease disjointness、prepare 戳）。</li>
+  <li class="principle"><b>in-doubt 的事务拖住的不只是写者，还有读者。</b>投了 YES 没结局的 T 让 t_safe 卡在它的 prepare 戳之前，戳越过它的读全等；修法是按 key range 细分。</li>
+  <li class="principle"><b>ε 大是性能问题，区间不包住真实时间是正确性问题。</b>前者多等、不出错、可发现；后者安静地返回错值、没有报错、事后不可修。</li>
+  <li class="principle"><b>每个系统都押一个假设，区别在破了掉 liveness 还是掉 safety。</b>Raft/2PC 的 safety 不依赖任何假设；Spanner 把 safety 押在时钟上，所以要用运维把它压到比硬件故障还低。掉 safety 的假设要么别押（3PC 的下场）要么压低且可监控。</li>
+  <li class="principle"><b>TrueTime 不代替 Raft，是加在几百个 Raft group 之上解决"共同时间轴"一个问题。</b>解决的是跨 shard 不是跨数据中心；只有一个 group 或不需要跨 group 一致读，整套可以不要。</li>
+  <li class="principle"><b>不分片就没有这个问题。</b>一台机器的 txid 天然全局，snapshot isolation 就是全部；Spanner 为必须分片的人设计。先问装不装得下，再问要不要 Spanner。</li>
+  <li class="principle"><b>区间只对调用那一瞬间成立。</b>所有规则都写成"在事件之后调 TT.now()"，不能提前算好存着用；"票到期了没"用 TT.before，压着模糊地带就当到期。</li>
+  <li class="principle"><b>解释一个有多层时间的东西，先把"时间"拆成几个词。</b>这篇我定了 s / t / c，定完之后前面几十轮的纠结一次收干净。</li>
+</ol>
+
+<h2 id="recall">8. 复述结果与回忆清单</h2>
+<table>
+<tr><th>道</th><th>考点</th><th>结果</th></tr>
+<tr><td>1</td><td>去掉 commit wait 构造倒置</td><td><b>实</b>。自己填的四个数：T1 [1,10] t=8 s=10 / T2 [2,9.8] t=9 s=9.8，只读挑 9.9</td></tr>
+<tr><td>2</td><td>t_safe 怎么算、两条前提、两种卡住</td><td>半实。第一答把时钟当主语，提示 watermark 后答对 t_safe 和两条前提；两种卡住答"network partition"太泛，不知道空闲 group 和 in-doubt 事务</td></tr>
+<tr><td>3</td><td>ε = 10 秒的后果</td><td>半实。写答"至少 10 秒"实为 20 秒；读答"不等"漏了 t_safe；正确性答"证明麻烦"，实为一句话</td></tr>
+<tr><td>4</td><td>2PC over Paxos 解决了什么</td><td>半实。"都有"对，"从修机器到选 leader"要追问；中间岔出约 15 轮</td></tr>
+<tr><td>5</td><td>TrueTime 假设破了</td><td>半实。例子要架子填数（s=115 &gt; c=102，R 挑 106 看不见）；"顺序执行却看不见"对；和 cp3 的对比没抓到"慢 vs 错"</td></tr>
+</table>
+<p>虚的共同点：<b>后果的量化</b>（等多久、哪一步破）和<b>两个相近东西的本质区别</b>（ε 大 vs 区间不包、修机器 vs 选 leader）。实的是构造反例，一向擅长。</p>
+<p>回忆题（progress.md 反复回忆清单）：① 读事务之间 s 可以倒，为什么 read2 不会旧（四步）；② lease 不重叠 / p_B 的目的，先说坏场景（log y@50 后来 y@45，戳 48 的读两个结果）再推规则；③ ε = 10 秒写等几秒读等几秒；④ ε 大 vs 区间不包 t，一句话本质区别。</p>
+
+<h2 id="reading">9. 延伸阅读</h2>
+<ul>
+  <li>Corbett et al. <a href="https://pdos.csail.mit.edu/6.824/papers/spanner.pdf">Spanner: Google's Globally-Distributed Database</a>. OSDI 2012. 本篇。§4.1.2 两条规则与五行证明，§4.1.3 safe time，§4.2.1 commit wait 结束前不 apply，§4.2.2 LastTS，§4.2.4 refinements，附录 A lease disjointness。</li>
+  <li>MIT 6.5840 <a href="https://pdos.csail.mit.edu/6.824/notes/l-spanner.txt">Spanner lecture notes</a> 与 <a href="https://pdos.csail.mit.edu/6.824/papers/spanner-faq.txt">FAQ</a>：T1/T2/T3 例子、"What goes wrong if clocks aren't correct"四种情况、FAQ 的 2 秒往返推导、Hatshepsut/Cassandra 例子。</li>
+  <li>Lamport. <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf">Time, Clocks, and the Ordering of Events in a Distributed System</a>. CACM 1978. 第二部分 Physical Clocks：误差有界时等 δ 就能保证顺序，commit wait 的雏形。</li>
+  <li>Kleppmann. <i>Designing Data-Intensive Applications</i> 第 8 章"不可靠的时钟"：Snowflake 脚注、时钟读数置信区间、"全局快照的同步时钟"一节直接讲 Spanner。中译 <a href="https://ddia.vonng.com/">ddia.vonng.com</a>。</li>
+  <li>Brewer. <a href="https://research.google/pubs/spanner-truetime-and-the-cap-theorem/">Spanner, TrueTime and the CAP Theorem</a> (2017). 为什么敢把正确性建在时钟上：把时钟当成和网络、磁盘一样要监控和踢掉的基础设施。</li>
+  <li>CockroachDB. <a href="https://www.cockroachlabs.com/blog/living-without-atomic-clocks/">Living Without Atomic Clocks</a>. HLC、max-offset 500 ms、不确定区重试、只到 serializable。课程 notes 末尾链接。</li>
+  <li>Ongaro. <a href="https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf">Consensus: Bridging Theory and Practice</a> (PhD thesis, 2014). §6.4 ReadIndex 的出处，Raft extended 论文里没有 follower 读。</li>
+  <li>Bronson et al. <a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson">TAO: Facebook's Distributed Data Store for the Social Graph</a>. USENIX ATC 2013. 几千个 MySQL shard、无跨 shard 事务、read-your-writes 级别。</li>
+  <li>AWS. <a href="https://github.com/aws/clock-bound">ClockBound</a> 与 Marc Brooker 的 <a href="https://brooker.co.za/blog/">DSQL 博客系列</a>：AWS 版 TrueTime，DSQL 用它发 commit timestamp，2PL+2PC 换成 OCC。</li>
+  <li>Chang et al. <a href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/">Bigtable</a>. OSDI 2006. (key, timestamp)→value 的存储格式、timestamp 降序的 SSTable，Spanner 的 tablet 从这来。</li>
+  <li>Spanner 团队. <a href="https://research.google/pubs/spanner-becoming-a-sql-system/">Spanner: Becoming a SQL System</a>. SIGMOD 2017. 五年后的续篇。</li>
+</ul>
+
+</div>
+</body>
+</html>

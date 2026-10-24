@@ -45,6 +45,11 @@
   <p class="sub">读 tech blog / 拆解 topic 的深读笔记。每篇记录:文章总结、机制拆解、我的疑问与解惑、经验连接、可移植的通用原则。由 <code>/deep-dive</code> 工作流生成。</p>
 
   <!-- NOTES-LIST:START (新笔记加在最上面) -->
+  <a class="note" href="notes/2026-10-24-spanner-truetime.html">
+    <div class="title">Spanner：用等待把不准的时钟变成全局顺序 — 戳是标签不是时刻、读的戳比大小没意义、假设破了掉的是 safety</div>
+    <div class="desc">几百个 Raft group 之间怎么有一个共同的时间轴 · zxid / Snowflake / Spanner 戳三种发号 · TrueTime 区间从哪来、TT.now() 不是网络调用 · 挑 latest 看见前人、等 commit wait 被后人看见 · "完成"= wait 结束 · 我定的 s / t / c 三个词 · 读事务之间 s 可以倒的四步证明与我自己的 w1 r1 w2 r2 例子 · t_safe = Flink watermark · LastTS 省的是等未来的写不是等复制 · ε 大是性能、区间不包 t 是正确性 · safety 假设 vs liveness 假设那张表 · 2PC over Paxos 缓解不消除 · p_B 与 lease 都在给"单 group 戳单调"补洞 · CockroachDB HLC · Postgres 用不分片躲开 · pump.fun 对账要全局戳不要 external consistency</div>
+    <div class="meta"><span class="tag">6.5840</span><span class="tag">论文拆解</span>2026-10-24 · 来源：Corbett et al., OSDI 2012</div>
+  </a>
   <a class="note" href="notes/2026-10-15-distributed-transactions-2pl-2pc.html">
     <div class="title">分布式事务：2PL、2PC、隔离级别 — 锁为什么攥到 COMMIT、YES 为什么交出了决定权</div>
     <div class="desc">三个名字三件事（2PL/2PC/Raft）· read committed → snapshot isolation → serializable 各漏什么 · 2PL 两条规则与"中间状态可以错只要没人看见" · no dirty write 在 MVCC 下到底防什么（卡了几年的那个）· 2PC 逐步崩溃与写盘时刻 · YES 之后两个世界消息序列相同 · 3PC 要完美判死 · 两将军 vs 拜占庭 · 全体 vs 多数派 · serializable 没有时间、单机也能不 linearizable · Raft 复制 TC · Kafka 事务 = 2PC · outbox 放弃了什么</div>
